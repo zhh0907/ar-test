@@ -23,7 +23,6 @@
         <script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js"></script>
         <script src="https://cdn.babylonjs.com/addons/babylonjs.addons.min.js"></script>
         <script src="https://cdn.babylonjs.com/inspector/babylon.inspector.bundle.js"></script>
-        <script src="https://cdn.babylonjs.com/materialsLibrary/babylon.gridMaterial.min.js"></script>
 
         <style>
             html,
@@ -64,13 +63,14 @@
         var scene = null;
         var sceneToRender = null;
         var createDefaultEngine = function() { return new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true,  disableWebGL2Support: false}); };
-        // ====== 配置:你的 GLB 文件路径(相对/绝对均可)======
-const MODEL_URL = "./lp_robot.glb";
+        // ===== 配置你的 GLB 文件路径 =====
+const MODEL_URL = "/models/myModel.glb";
+// 大多数 GLTF 模型“向前”为 -Z;若你的模型向前是 +Z,把它改成 +1
+const MODEL_FORWARD_SIGN = -1; // -1: -Z 前向(常见);+1: +Z 前向
 
-// ====== createScene 全量实现 ======
 var createScene = async function () {
   const scene = new BABYLON.Scene(engine);
-  scene.clearColor = new BABYLON.Color4(0, 0, 0, 0); // AR 透视;VR 回退时改为不透明
+  scene.clearColor = new BABYLON.Color4(0, 0, 0, 0); // AR 透视
 
   // --- Camera & Light ---
   const camera = new BABYLON.FreeCamera("camera1", new BABYLON.Vector3(0, 5, -6), scene);
@@ -79,57 +79,50 @@ var createScene = async function () {
   const light = new BABYLON.HemisphericLight("light1", new BABYLON.Vector3(0,1,0), scene);
   light.intensity = 0.9;
 
-  // --- Ground:高对比网格(不发光) ---
-  const ground = BABYLON.MeshBuilder.CreateGround("myGround", { width: 30, height: 30, subdivisions: 2 }, scene);
+  // --- Ground:只显示网格线,底面完全透明 ---
+  const ground = BABYLON.MeshBuilder.CreateGround("myGround", { width: 30, height: 30 }, scene);
   ground.position.y = 0;
   ground.isPickable = true;
 
   const gridMat = new BABYLON.GridMaterial("gridMat", scene);
-  gridMat.gridRatio = 1.0;                 // 每格大小
-  gridMat.majorUnitFrequency = 10;          // 粗网格频率
-  gridMat.minorUnitVisibility = 6;       // 细网格可见度(高一些=线更“粗”)
-  gridMat.lineColor = new BABYLON.Color3(0.0, 0.95, 0.55); // 明亮但不发光
-  gridMat.mainColor = new BABYLON.Color3(0, 0, 0);         // 面色深色衬托
-  gridMat.opacity = 2;                  // 面半透明(别太高以免挡视野)
+  gridMat.gridRatio = 1.0;
+  gridMat.majorUnitFrequency = 4;
+  gridMat.minorUnitVisibility = 0.9;
+  gridMat.lineColor = new BABYLON.Color3(0.95, 1.0, 0.95);
+  gridMat.mainColor = new BABYLON.Color3(0, 0, 0);
+  gridMat.opacity = 0.0;                   // 背景完全透明
+  gridMat.alpha = 0.0;                     // 兼容某些平台
+  gridMat.disableLighting = true;
   gridMat.transparencyMode = BABYLON.Material.MATERIAL_ALPHABLEND;
   gridMat.backFaceCulling = false;
   gridMat.zOffset = -1;
   ground.material = gridMat;
 
-  // --- 高亮层(用于悬停/锁定显示,不改模型材质) ---
+  // --- Highlight(悬停/锁定) ---
   const hl = new BABYLON.HighlightLayer("hl", scene);
-  hl.innerGlow = false;
-  hl.outerGlow = true;
-  hl.blurHorizontalSize = 1.0;
-  hl.blurVerticalSize   = 1.0;
-  const HIGHLIGHT_COLOR = new BABYLON.Color3(1.0, 0.85, 0.3);
+  hl.innerGlow = false; hl.outerGlow = true;
+  hl.blurHorizontalSize = 1.0; hl.blurVerticalSize = 1.0;
+  const HLCOLOR = new BABYLON.Color3(1.0, 0.85, 0.3);
 
-  // --- 预载 GLB 容器(后续实例化,不重复网络加载) ---
-  // 用 rootUrl + sceneFilename 形式更稳妥
-  const glbContainer = await BABYLON.SceneLoader.LoadAssetContainerAsync(
-    "", MODEL_URL, scene
-  );
-  // 从场景移除母本,仅当作模板
+  // --- 预载 GLB ---
+  const glbContainer = await BABYLON.SceneLoader.LoadAssetContainerAsync("", MODEL_URL, scene);
   glbContainer.removeAllFromScene();
 
-  // --- XR:AR 优先,VR 回退,并禁用内置摇杆移动/传送 ---
+  // --- XR:AR 优先,VR 回退 & 禁用内置移动/传送 ---
   let xr;
   try {
     const supportsAR = await BABYLON.WebXRSessionManager.IsSessionSupportedAsync("immersive-ar");
-    if (!supportsAR) throw new Error("AR not supported");
-
+    if (!supportsAR) throw new Error("no AR");
     xr = await scene.createDefaultXRExperienceAsync({
       sessionMode: "immersive-ar",
       referenceSpaceType: "local-floor",
       uiOptions: { sessionMode: "immersive-ar" },
       optionalFeatures: true
     });
-
     xr.baseExperience.featuresManager.enableFeature(
       BABYLON.WebXRBackgroundRemover.Name, "latest",
       { environmentHelperRemoval: true, skyBoxRemoval: true }
     );
-
     const fm = xr.baseExperience.featuresManager;
     try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); } catch {}
     try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION); } catch {}
@@ -141,49 +134,44 @@ var createScene = async function () {
     });
     scene.createDefaultEnvironment({ createGround:false, createSkybox:true, enableGroundShadow:true });
     scene.clearColor = new BABYLON.Color4(0,0,0,1);
-
     const fm = xr.baseExperience.featuresManager;
     try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); } catch {}
     try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION); } catch {}
   }
 
   // ====== 状态 ======
-  /** @type {BABYLON.WebXRInputSource|null} */ let rightCtrl = null;
-  /** @type {BABYLON.WebXRInputSource|null} */ let leftCtrl  = null;
+  let rightCtrl = null, leftCtrl = null;
+  let hoveredRoot = null, lockedRoot = null;
 
-  // 悬停 / 锁定(针对“模型实例的根节点 TransformNode”)
-  /** @type {BABYLON.TransformNode|null} */ let hoveredRoot = null;
-  /** @type {BABYLON.TransformNode|null} */ let lockedRoot  = null;
-
-  // 右摇杆输入
   let stickX = 0, stickY = 0;
   let stickPressed = false;
+  let stickPressDownAt = 0;
+  const LONG_PRESS_MS = 450; // 长按用于解锁
 
-  // 连续移动参数(方向 + 标量速度)
-  const DEADZONE_IN  = 0.15;   // 进入死区阈值(滞回)
-  const DEADZONE_OUT = 0.10;   // 退出死区阈值
+  // 连续移动(方向 + 标量速度)
+  const DEADZONE_IN  = 0.15;
+  const DEADZONE_OUT = 0.10;
   let   inputActive  = false;
 
-  const MAX_SPEED = 2.2;       // 最大平移速度(单位/秒)
-  const ACCEL_ON  = 14.0;      // 加速响应
-  const ACCEL_OFF = 4.0;       // 松杆减速响应(越小惯性越大)
-  const DIR_LERP  = 12.0;      // 方向平滑
-  let   curSpeed  = 0.0;       // 当前速度
-  let   moveDir   = new BABYLON.Vector3(0,0,0); // 当前方向(单位向量,水平)
+  const MAX_SPEED = 2.2;
+  const ACCEL_ON  = 14.0;
+  const ACCEL_OFF = 4.0;
+  const DIR_LERP  = 12.0;
+  let   curSpeed  = 0.0;
+  let   moveDir   = new BABYLON.Vector3(0,0,0);
 
-  // 右扳机生成防抖
+  // 生成防抖
   let rightTriggerDown = false;
   let lastSpawnAt = 0;
-  const MIN_INTERVAL = 150; // ms
+  const MIN_INTERVAL = 150;
 
-  // ====== 工具函数 ======
+  // ====== 工具 ======
   function rayFromController(ctrl, length = 100) {
     const origin = ctrl.pointer.position.clone();
     const fwd = BABYLON.Vector3.TransformNormal(BABYLON.Axis.Z, ctrl.pointer.getWorldMatrix()).normalize();
     return new BABYLON.Ray(origin, fwd, length);
   }
 
-  // 计算根节点的半高(world),用于贴地
   function computeHalfY(root) {
     let minY = +Infinity, maxY = -Infinity;
     root.getChildMeshes().forEach((m) => {
@@ -192,24 +180,20 @@ var createScene = async function () {
       if (vmin.y < minY) minY = vmin.y;
       if (vmax.y > maxY) maxY = vmax.y;
     });
-    const h = Math.max(0, maxY - minY);
-    return h * 0.5;
+    return Math.max(0, maxY - minY) * 0.5;
   }
 
-  // 根节点高亮切换
   function setRootHighlight(root, on) {
     const meshes = root.getChildMeshes();
-    if (on) meshes.forEach(m => hl.addMesh(m, HIGHLIGHT_COLOR));
+    if (on) meshes.forEach(m => hl.addMesh(m, HLCOLOR));
     else    meshes.forEach(m => hl.removeMesh(m));
   }
 
-  // 实例化一个 GLB 模型,返回统一根 TransformNode
   function instantiateModel(name, scene) {
     const inst = glbContainer.instantiateModelsToScene((src) => `${name}_${src}`, false);
     const root = new BABYLON.TransformNode(`${name}_root`, scene);
     inst.rootNodes.forEach((n) => { n.parent = root; });
 
-    // 子网格设置为可拾取,并写入“回溯到 root”的 metadata
     root.getChildMeshes().forEach((m) => {
       m.isPickable = true;
       m.metadata = m.metadata || {};
@@ -218,38 +202,81 @@ var createScene = async function () {
 
     root.metadata = root.metadata || {};
     root.metadata.isSpawnedModel = true;
-
+    root.metadata.inst = inst;
+    root.metadata.halfY = 0;
+    root.metadata.animPlaying = false; // ★ 动画播放开关(右摇杆短按切换)
     return root;
   }
 
-  // 在地面交点生成一个 GLB 实例
+  // —— 动画控制 —— //
+  function clipPick(groups, ks) {
+    const kw = ks.map(k => k.toLowerCase());
+    const out = groups.filter(g => kw.some(k => g.name.toLowerCase().includes(k)));
+    return out.length ? out : null;
+  }
+  function stopToStatic(root) {
+    const inst = root?.metadata?.inst; if (!inst) return;
+    const groups = inst.animationGroups || [];
+    groups.forEach(ag => { ag.stop(); ag.reset(); ag.goToFrame(ag.from); });
+    const idle = clipPick(groups, ["idle"]);
+    if (idle) idle.forEach(ag => { ag.stop(); ag.reset(); ag.goToFrame(ag.from); });
+    else if (groups[0]) { groups[0].stop(); groups[0].reset(); groups[0].goToFrame(groups[0].from); }
+    root.metadata.animPlaying = false;
+  }
+  function playMovingLoop(root) {
+    const inst = root?.metadata?.inst; if (!inst) return;
+    const groups = inst.animationGroups || []; if (!groups.length) return;
+
+    // 每次切换前先干净复位,避免叠加
+    groups.forEach(ag => { ag.stop(); ag.reset(); ag.goToFrame(ag.from); });
+
+    let playList = clipPick(groups, ["walk","move","run"]);
+    if (!playList) playList = clipPick(groups, ["idle"]);
+    if (!playList) playList = groups;
+
+    playList.forEach(ag => ag.start(true, 1.0, ag.from, ag.to));
+    root.metadata.animPlaying = true;
+  }
+
+  // —— 让模型“正对用户” ——
+  function faceUserYaw(root) {
+    const cam = (xr && xr.baseExperience && xr.baseExperience.camera) || scene.activeCamera;
+    if (!cam) return;
+    const dir = cam.globalPosition.subtract(root.position);
+    let yaw = Math.atan2(dir.x, dir.z);
+    if (MODEL_FORWARD_SIGN === +1) yaw += Math.PI;
+    root.rotationQuaternion = null;
+    root.rotation.y = yaw;
+  }
+
   function spawnModelAt(point) {
     const root = instantiateModel("spawnedModel", scene);
 
-    // 如需缩放/旋转可在这里改:
-    // root.scaling.set(1, 1, 1);
-    // root.rotationQuaternion = BABYLON.Quaternion.Identity();
-
-    // 先把 root 放到目标位置,再计算 halfY
+    // 放置到点并面向用户
     root.position.copyFrom(point);
-    const halfY = computeHalfY(root);
-    root.position.y = ground.position.y + halfY;
-    root.metadata.halfY = halfY;
+    faceUserYaw(root);
 
-    // 弹入动画
+    // 贴地
+    const halfY = computeHalfY(root);
+    root.metadata.halfY = halfY;
+    root.position.y = ground.position.y + halfY;
+
+    // 生成时静态
+    stopToStatic(root);
+
+    // 弹入
     root.scaling.set(0.01,0.01,0.01);
     BABYLON.Animation.CreateAndStartAnimation(
       "popIn", root, "scaling", 60, 10,
       new BABYLON.Vector3(0.01,0.01,0.01), new BABYLON.Vector3(1,1,1),
       BABYLON.Animation.ANIMATIONLOOPMODE_CONSTANT
     );
-
     return root;
   }
 
-  // 悬停/锁定切换
+  // 悬停/锁定
   function setHoveredRoot(rootOrNull) {
-    if (lockedRoot) return; // 已锁定时不改 hover
+    if (lockedRoot) return;
     if (hoveredRoot === rootOrNull) return;
     if (hoveredRoot) setRootHighlight(hoveredRoot, false);
     hoveredRoot = rootOrNull || null;
@@ -260,27 +287,27 @@ var createScene = async function () {
     setRootHighlight(hoveredRoot, false);
     lockedRoot = hoveredRoot;
     hoveredRoot = null;
-    setRootHighlight(lockedRoot, true); // 锁定时持续高亮
+    setRootHighlight(lockedRoot, true);
+    // 锁定后保持当前动画状态(默认静态)
   }
   function unlockCurrent() {
     if (!lockedRoot) return;
+    // 解锁不强制停动画,如需停请改成 stopToStatic(lockedRoot);
     setRootHighlight(lockedRoot, false);
     lockedRoot = null;
   }
 
-  // 只取控制器“水平(yaw)”基向量,避免 pitch/roll 导致方向跳变
-  const tmpRight = new BABYLON.Vector3();
-  const tmpFwd   = new BABYLON.Vector3();
-  function getHorizontalBasisFromController(ctrl) {
+  // —— 只取控制器 yaw 的水平基向量 —— //
+  const tmpR = new BABYLON.Vector3(), tmpF = new BABYLON.Vector3();
+  function horizontalBasis(ctrl) {
     const m = ctrl.pointer.getWorldMatrix();
-    tmpRight.copyFrom(BABYLON.Vector3.TransformNormal(BABYLON.Axis.X, m));
-    tmpFwd.copyFrom(BABYLON.Vector3.TransformNormal(BABYLON.Axis.Z, m)).scaleInPlace(-1);
-    tmpRight.y = 0; tmpFwd.y = 0;
-    if (tmpRight.lengthSquared() < 1e-6) tmpRight.copyFrom(BABYLON.Axis.X);
-    if (tmpFwd.lengthSquared()   < 1e-6) tmpFwd.copyFrom(BABYLON.Axis.Z);
-    tmpRight.normalize();
-    tmpFwd.normalize();
-    return { right: tmpRight, fwd: tmpFwd };
+    tmpR.copyFrom(BABYLON.Vector3.TransformNormal(BABYLON.Axis.X, m));
+    tmpF.copyFrom(BABYLON.Vector3.TransformNormal(BABYLON.Axis.Z, m)).scaleInPlace(-1);
+    tmpR.y = 0; tmpF.y = 0;
+    if (tmpR.lengthSquared() < 1e-6) tmpR.copyFrom(BABYLON.Axis.X);
+    if (tmpF.lengthSquared() < 1e-6) tmpF.copyFrom(BABYLON.Axis.Z);
+    tmpR.normalize(); tmpF.normalize();
+    return { right: tmpR, fwd: tmpF };
   }
 
   // ====== 控制器事件 ======
@@ -311,7 +338,7 @@ var createScene = async function () {
           });
         }
 
-        // 右摇杆:轴 + 点击(按下=锁定/解锁)
+        // 右摇杆:轴 + 点击(短按:锁定/切动画;长按:解锁)
         const stick = mc.getComponent("xr-standard-thumbstick");
         if (stick) {
           stick.onAxisValueChangedObservable.add((axes) => {
@@ -321,14 +348,32 @@ var createScene = async function () {
           stick.onButtonStateChangedObservable.add(() => {
             const pressed = !!stick.pressed;
             if (pressed && !stickPressed) {
+              // 按下时记录时间
               stickPressed = true;
-              if (lockedRoot) {
-                unlockCurrent();
-              } else if (hoveredRoot) {
-                lockCurrentHovered();
-              }
+              stickPressDownAt = performance.now();
             } else if (!pressed && stickPressed) {
+              // 松开:判断长短按
               stickPressed = false;
+              const dur = performance.now() - stickPressDownAt;
+              const isLong = dur >= LONG_PRESS_MS;
+
+              if (isLong) {
+                // 长按:解锁
+                if (lockedRoot) unlockCurrent();
+              } else {
+                // 短按:
+                if (!lockedRoot) {
+                  // 未锁定 -> 锁定当前悬停
+                  if (hoveredRoot) lockCurrentHovered();
+                } else {
+                  // 已锁定 -> 切换动画开/关
+                  if (lockedRoot.metadata.animPlaying) {
+                    stopToStatic(lockedRoot);
+                  } else {
+                    playMovingLoop(lockedRoot);
+                  }
+                }
+              }
             }
           });
         }
@@ -347,7 +392,7 @@ var createScene = async function () {
   scene.onBeforeRenderObservable.add(() => {
     const dt = scene.getEngine().getDeltaTime() / 1000;
 
-    // 悬停:仅当未锁定时响应
+    // 悬停(未锁定)
     if (!lockedRoot && rightCtrl) {
       const ray = rayFromController(rightCtrl);
       const pick = scene.pickWithRay(ray, (m) => !!m.metadata?.spawnedRoot);
@@ -355,46 +400,37 @@ var createScene = async function () {
       setHoveredRoot(root);
     }
 
-    // 锁定时,右摇杆驱动连续移动
+    // 锁定时:右摇杆控制“任意角度”在水平面移动(动画状态不受输入影响)
     if (lockedRoot && rightCtrl) {
-      // 1) 死区滞回:决定 inputActive
       const mag = Math.hypot(stickX, stickY);
-      if (!inputActive) {
-        if (mag > DEADZONE_IN) inputActive = true;
-      } else {
-        if (mag < DEADZONE_OUT) inputActive = false;
-      }
+      if (!inputActive) { if (mag > DEADZONE_IN) inputActive = true; }
+      else              { if (mag < DEADZONE_OUT) inputActive = false; }
 
-      // 2) 控制器水平基向量(仅 yaw)
-      const { right: basisR, fwd: basisF } = getHorizontalBasisFromController(rightCtrl);
+      const { right: R, fwd: F } = horizontalBasis(rightCtrl);
 
-      // 3) 目标方向 + 目标速度
       let targetDir = moveDir.clone();
       let targetSpeed = 0;
+
       if (inputActive) {
-        targetDir = basisR.scale(stickX).addInPlace(basisF.scale(stickY));
+        targetDir = R.scale(stickX).addInPlace(F.scale(stickY));
         targetDir.y = 0;
         if (targetDir.lengthSquared() > 1e-6) targetDir.normalize();
         targetSpeed = MAX_SPEED * Math.min(1, mag);
       }
 
-      // 4) 方向平滑
       if (targetDir.lengthSquared() > 1e-6) {
-        const alpha = Math.min(1, DIR_LERP * dt);
-        moveDir.x += (targetDir.x - moveDir.x) * alpha;
-        moveDir.z += (targetDir.z - moveDir.z) * alpha;
+        const a = Math.min(1, DIR_LERP * dt);
+        moveDir.x += (targetDir.x - moveDir.x) * a;
+        moveDir.z += (targetDir.z - moveDir.z) * a;
         if (moveDir.lengthSquared() > 1e-6) moveDir.normalize();
       }
-
-      // 5) 速度平滑(加/减速无过冲)
       const accel = inputActive ? ACCEL_ON : ACCEL_OFF;
       curSpeed += (targetSpeed - curSpeed) * Math.min(1, accel * dt);
 
-      // 6) 应用位移并贴地
       if (curSpeed > 1e-4 && moveDir.lengthSquared() > 1e-6) {
         const delta = moveDir.scale(curSpeed * dt);
         const newPos = lockedRoot.position.add(delta);
-        const halfY = lockedRoot.metadata.halfY ?? computeHalfY(lockedRoot);
+        const halfY = lockedRoot.metadata.halfY || computeHalfY(lockedRoot);
         newPos.y = ground.position.y + halfY;
         lockedRoot.position.copyFrom(newPos);
       }
@@ -437,4 +473,3 @@ var createScene = async function () {
         </script>
     </body>
 </html>
-
