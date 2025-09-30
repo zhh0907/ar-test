@@ -74,19 +74,19 @@
   const light = new BABYLON.HemisphericLight("hemi", new BABYLON.Vector3(0, 1, 0), scene);
   light.intensity = 0.8;
 
-  // --- 环境(PC/VR 测试;AR 时隐藏) ---
+  // --- 环境(用于PC测试;进入AR时隐藏) ---
   const env = scene.createDefaultEnvironment({
     enableGroundShadow: false,
     createSkybox: true,
     createGround: true,
     groundSize: 20
   });
-  if (env?.ground) {
+  if (env && env.ground) {
     env.ground.isPickable = true;
     env.ground.position.y = 0;
   }
 
-  // --- 准星 ---
+  // --- 准星(命中结果可视化) ---
   const reticle = BABYLON.MeshBuilder.CreateTorus("reticle", {
     diameter: 0.12,
     thickness: 0.006,
@@ -100,11 +100,11 @@
   reticle.isPickable = false;
   reticle.setEnabled(false);
 
-  // --- 生成 Box(含锚点限流) ---
+  // --- 生成蓝色 Box 的工具函数(带锚点限流) ---
   let spawnCount = 0;
   const MAX_SPAWNS = 30;
 
-  async function spawnBoxAt(position, rotationQuaternion, anchorSystem, useAnchor) {
+  async function spawnBoxAt(position, rotationQuaternion, anchorSystem) {
     if (spawnCount >= MAX_SPAWNS) return;
 
     const box = BABYLON.MeshBuilder.CreateBox("spawnBox", { size: 0.15 }, scene);
@@ -114,13 +114,14 @@
     box.material = mat;
 
     try {
-      if (useAnchor && anchorSystem?.isEnabled) {
+      if (anchorSystem && anchorSystem.isEnabled) {
         const anchor = await anchorSystem.addAnchorAtPositionAndRotation(
           position,
           rotationQuaternion || BABYLON.Quaternion.Identity()
         );
-        if (anchor?.attachedNode) box.setParent(anchor.attachedNode);
-        else {
+        if (anchor && anchor.attachedNode) {
+          box.setParent(anchor.attachedNode);
+        } else {
           box.position.copyFrom(position);
           if (rotationQuaternion) box.rotationQuaternion = rotationQuaternion.clone();
         }
@@ -130,6 +131,7 @@
       }
       spawnCount++;
     } catch (e) {
+      // Anchor 失败则直接放置
       box.position.copyFrom(position);
       if (rotationQuaternion) box.rotationQuaternion = rotationQuaternion.clone();
       spawnCount++;
@@ -137,165 +139,94 @@
   }
 
   // =========================================================
-  // ===================== WebXR 统一初始化 ===================
+  // =============== WebXR: AR + Hit Test ====================
   // =========================================================
-  // 不强制 sessionMode,交由 Playground 的按钮决定(VR/AR 都能用)
   const xr = await scene.createDefaultXRExperienceAsync({
     disableDefaultUI: false,
+    // 更兼容的参考空间:"local"(需要地板高度时再换回 "local-floor" 做对比)
+    uiOptions: { sessionMode: "immersive-ar", referenceSpaceType: "local" },
     optionalFeatures: true
   });
 
-  const fm = xr.baseExperience.featuresManager;
-
-  // 可能启用的特性
-  let hitTest = null;        // 仅用于 AR
-  let anchorSystem = null;   // 仅用于 AR
-  let pointerSelection = null; // VR/AR 都可用(控制器射线拾取)
-
-  // 运行时状态
-  let inXR = false;
-  let isAR = false; // immersive-ar?
-  let lastHitPose = null;
-
-  // 进入/退出 XR:按模式切换可见性 & 启用特性
-  xr.baseExperience.onStateChangedObservable.add((state) => {
-    inXR = (state === BABYLON.WebXRState.IN_XR || state === BABYLON.WebXRState.ENTERING_XR);
-
-    if (!inXR) {
-      // 回到桌面
-      if (env?.ground) env.ground.isVisible = true;
-      if (env?.skybox) env.skybox.isVisible = true;
-      reticle.setEnabled(false);
-      lastHitPose = null;
-      return;
-    }
-
-    // 进入 XR 后再判断模式
-    const mode = xr.baseExperience.sessionManager.sessionMode || "";
-    isAR = (mode === "immersive-ar");
-
-    // AR:隐藏环境;VR:保留环境用于拾取
-    if (env?.ground) env.ground.isVisible = !isAR ? true : false;
-    if (env?.skybox) env.skybox.isVisible = !isAR ? true : false;
-
-    // 启用/关闭特性(只启一次即可)
-    try {
-      if (!pointerSelection) {
-        pointerSelection = fm.enableFeature(BABYLON.WebXRFeatureName.POINTER_SELECTION, "latest", {
-          xrInput: xr.input,
-          enablePointerSelectionOnAllControllers: true
-        });
-      }
-    } catch (e) {
-      console.warn("POINTER_SELECTION enable failed:", e);
-    }
-
-    if (isAR) {
-      // AR:启用 Hit Test + Anchor
-      try {
-        if (!hitTest) {
-          hitTest = fm.enableFeature(BABYLON.WebXRFeatureName.HIT_TEST, "latest", {
-            // viewer ray 最稳
-            offsetRay: new BABYLON.Ray(new BABYLON.Vector3(0, 0, 0), new BABYLON.Vector3(0, 0, -1), 1.0),
-            enableTransientHitTest: true
-          });
-          hitTest.onHitTestResultObservable.add(results => {
-            if (results && results.length > 0) {
-              const r = results[0];
-              lastHitPose = {
-                position: r.position.clone(),
-                rotationQuaternion: r.rotationQuaternion ? r.rotationQuaternion.clone() : BABYLON.Quaternion.Identity()
-              };
-              reticle.setEnabled(true);
-              reticle.position.copyFrom(lastHitPose.position);
-              reticle.rotationQuaternion = BABYLON.Quaternion.FromEulerAngles(Math.PI / 2, 0, 0);
-            } else {
-              lastHitPose = null;
-              reticle.setEnabled(false);
-            }
-          });
-        }
-      } catch (e) {
-        console.warn("HIT_TEST enable failed:", e);
-      }
-
-      try {
-        if (!anchorSystem) {
-          anchorSystem = fm.enableFeature(BABYLON.WebXRFeatureName.ANCHOR_SYSTEM, "latest", {});
-        }
-      } catch (e) {
-        console.warn("ANCHOR_SYSTEM enable failed:", e);
-      }
-    } else {
-      // VR:不用 hitTest / anchor;用控制器射线做拾取(在 onSelectStart 里实现)
-      reticle.setEnabled(false);
-      lastHitPose = null;
-    }
+  // 进入/退出 XR 时隐藏/显示环境(AR 背景是现实世界)
+  xr.baseExperience.onStateChangedObservable.add(state => {
+    const inXR = (state === BABYLON.WebXRState.IN_XR || state === BABYLON.WebXRState.ENTERING_XR);
+    if (env && env.ground) env.ground.isVisible = !inXR;
+    if (env && env.skybox) env.skybox.isVisible = !inXR;
   });
 
-  // =========================================================
-  // ============= 统一的“点击/扳机”生成逻辑 =================
-  // =========================================================
+  // 启用 Hit Test(使用 viewer ray,避免对 plane 的依赖带来设备兼容问题)
+  const fm = xr.baseExperience.featuresManager;
+
+  let hitTest = null;
+  try {
+    hitTest = fm.enableFeature(BABYLON.WebXRFeatureName.HIT_TEST, "latest", {
+      // 从视线正前方向外发射射线
+      offsetRay: new BABYLON.Ray(new BABYLON.Vector3(0, 0, 0), new BABYLON.Vector3(0, 0, -1), 1.0),
+      enableTransientHitTest: true
+      // 不指定 entityTypes,优先保证稳定
+    });
+  } catch (e) {
+    console.warn("HIT_TEST feature failed to enable:", e);
+  }
+
+  // 可选:Anchor(若不支持会返回 null)
+  let anchorSystem = null;
+  try {
+    anchorSystem = fm.enableFeature(BABYLON.WebXRFeatureName.ANCHOR_SYSTEM, "latest", {});
+  } catch (e) {
+    console.warn("ANCHOR_SYSTEM feature failed to enable:", e);
+  }
+
+  let lastHitPose = null;
+
+  if (hitTest) {
+    hitTest.onHitTestResultObservable.add(results => {
+      if (results && results.length > 0) {
+        const r = results[0];
+        lastHitPose = {
+          position: r.position.clone(),
+          rotationQuaternion: r.rotationQuaternion ? r.rotationQuaternion.clone() : BABYLON.Quaternion.Identity()
+        };
+        reticle.setEnabled(true);
+        reticle.position.copyFrom(lastHitPose.position);
+        reticle.rotationQuaternion = BABYLON.Quaternion.FromEulerAngles(Math.PI / 2, 0, 0);
+      } else {
+        lastHitPose = null;
+        reticle.setEnabled(false);
+      }
+    });
+  }
+
+  // 控制器/屏幕点击:一次点击只生成一次(去抖)
   xr.input.onControllerAddedObservable.add(controller => {
-    // 统一一次性点击事件(屏幕点击、手柄扳机)
+    // 触屏 AR & 简易点击:统一使用 onSelectStart(可靠的一次性事件)
     controller.onSelectStartObservable.add(() => {
-      if (isAR) {
-        // AR:优先用 hitTest
-        if (lastHitPose) {
-          spawnBoxAt(lastHitPose.position, lastHitPose.rotationQuaternion, anchorSystem, /*useAnchor*/ true);
-          return;
-        }
+      if (lastHitPose) {
+        spawnBoxAt(lastHitPose.position, lastHitPose.rotationQuaternion, anchorSystem);
       }
-
-      // VR 或 AR 无 hit:用控制器射线对 ground 拾取
-      // controller.pointer 是一个 TransformNode,指向“前方”
-      const pointerNode = controller.pointer || controller.grip || null;
-      if (pointerNode) {
-        const origin = pointerNode.getAbsolutePosition ? pointerNode.getAbsolutePosition() : pointerNode.absolutePosition || pointerNode.position;
-        const forward = pointerNode.getDirection ? pointerNode.getDirection(BABYLON.Axis.Z) : new BABYLON.Vector3(0, 0, 1);
-        const ray = new BABYLON.Ray(origin, forward, 20);
-
-        const pick = scene.pickWithRay(ray, (mesh) => {
-          // VR 时通常用地面当落点;如需也允许打到其它 mesh,可在此扩展
-          return mesh === env?.ground;
-        });
-
-        if (pick?.hit && pick.pickedPoint) {
-          spawnBoxAt(pick.pickedPoint, BABYLON.Quaternion.Identity(), /*anchor*/ null, /*useAnchor*/ false);
-          // 同步一个可视化的准星位置(可选)
-          reticle.setEnabled(true);
-          reticle.position.copyFrom(pick.pickedPoint);
-          reticle.rotationQuaternion = BABYLON.Quaternion.FromEulerAngles(Math.PI / 2, 0, 0);
-          return;
-        } else {
-          // 没打到地面:在控制器前方 1.2m 处兜底生成
-          const fallbackPos = origin.add(forward.scale(1.2));
-          spawnBoxAt(fallbackPos, BABYLON.Quaternion.Identity(), null, false);
-          return;
-        }
-      }
-
-      // 没有 pointerNode(极少见):在相机前方兜底
-      const fallback = camera.position.add(camera.getDirection(BABYLON.Axis.Z).scale(1.5));
-      spawnBoxAt(fallback, BABYLON.Quaternion.Identity(), null, false);
     });
 
-    // 真·手柄(扳机上升沿去抖,避免“连发”)
+    // 真·手柄(如右手扳机)额外做“上升沿”防抖
     controller.onMotionControllerInitObservable.add(mc => {
-      if (mc?.handedness === "right") {
+      // 注意:Babylon 属性名为 handedness(不是 handness)
+      if (mc.handedness === "right") {
+        // 找到扳机组件(不同设备 id 可能不同)
         const triggerId = mc.getComponentIds().find(id => id.indexOf("trigger") !== -1) || "xr-standard-trigger";
         const trigger = mc.getComponent(triggerId);
         if (!trigger) return;
 
-        let ready = true;
+        let ready = true; // 上升沿门闩
         trigger.onButtonStateChangedObservable.add(c => {
+          // 仅在 pressed 从 false->true 且(如有)压值足够时触发一次
           const val = (typeof c.value === "number") ? c.value : 1.0;
           if (c.pressed && ready && val >= 0.9) {
             ready = false;
-            // 触发一次,沿用与 onSelectStart 同样的逻辑
-            controller.onSelectStartObservable.notifyObservers(controller);
+            if (lastHitPose) {
+              spawnBoxAt(lastHitPose.position, lastHitPose.rotationQuaternion, anchorSystem);
+            }
           }
-          if (!c.pressed) ready = true;
+          if (!c.pressed) ready = true; // 松开后复位
         });
       }
     });
@@ -304,8 +235,9 @@
   // =========================================================
   // =============== PC / 无手柄 测试逻辑 =====================
   // =========================================================
+  // 在桌面模式下,用鼠标在地面上移动显示准星;左键点击生成 Box
   const pickGroundAndUpdateReticle = (x, y) => {
-    if (!env?.ground) return;
+    if (!env || !env.ground) return;
     const pick = scene.pick(x, y, mesh => mesh === env.ground);
     if (pick && pick.hit) {
       reticle.setEnabled(true);
@@ -316,7 +248,7 @@
         rotationQuaternion: BABYLON.Quaternion.Identity()
       };
     } else {
-      if (!inXR) {
+      if (xr.baseExperience.state !== BABYLON.WebXRState.IN_XR) {
         reticle.setEnabled(false);
         lastHitPose = null;
       }
@@ -324,18 +256,24 @@
   };
 
   scene.onPointerMove = () => {
-    if (!inXR) pickGroundAndUpdateReticle(scene.pointerX, scene.pointerY);
+    // 仅在非 XR(桌面)时用鼠标更新准星
+    if (xr.baseExperience.state !== BABYLON.WebXRState.IN_XR) {
+      pickGroundAndUpdateReticle(scene.pointerX, scene.pointerY);
+    }
   };
 
   scene.onPointerDown = (evt) => {
-    if (!inXR) {
+    if (xr.baseExperience.state !== BABYLON.WebXRState.IN_XR) {
+      // 桌面左键点击生成
       if (evt.button === 0 && lastHitPose) {
-        spawnBoxAt(lastHitPose.position, lastHitPose.rotationQuaternion, null, false);
+        spawnBoxAt(lastHitPose.position, lastHitPose.rotationQuaternion, null /* 桌面无 anchor */);
       }
     }
   };
 
+  // 初始把准星藏起来,等有命中或鼠标移到地面时再显示
   reticle.setEnabled(false);
+
   return scene;
 };
 
