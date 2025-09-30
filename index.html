@@ -87,11 +87,11 @@ var createScene = async function () {
   const gridMat = new BABYLON.GridMaterial("gridMat", scene);
   gridMat.gridRatio = 1.0;
   gridMat.majorUnitFrequency = 4;
-  gridMat.minorUnitVisibility = 3;               // 线“更粗/密”
- gridMat.lineColor = new BABYLON.Color3(0.0, 0.95, 0.55); // 纯白更显眼
+  gridMat.minorUnitVisibility = 0.9;               // 线更清晰
+  gridMat.lineColor = new BABYLON.Color3(1.0, 1.0, 1.0);
   gridMat.mainColor = new BABYLON.Color3(0, 0, 0);
-  gridMat.opacity = 0.03;                           // ★ 留极小不透明以稳定显示线条(0 会整材质被跳过)
-  gridMat.alpha = gridMat.opacity;                  // 兼容不同平台
+  gridMat.opacity = 0.03;                           // 留极小不透明以稳定渲染线条
+  gridMat.alpha = gridMat.opacity;
   gridMat.disableLighting = true;
   gridMat.transparencyMode = BABYLON.Material.MATERIAL_ALPHABLEND;
   gridMat.backFaceCulling = false;
@@ -144,9 +144,9 @@ var createScene = async function () {
   let hoveredRoot = null, lockedRoot = null;
 
   let stickX = 0, stickY = 0;
-  let stickPressed = false;
-  let stickPressDownAt = 0;
-  const LONG_PRESS_MS = 450; // 长按用于解锁
+  let stickIsDown = false;            // 摇杆按钮是否已按下(上升沿去抖)
+  let lastClickAt = 0;                // 点击时间戳
+  const CLICK_DEBOUNCE_MS = 250;      // 点击去抖窗口
 
   // 连续移动(方向 + 标量速度)
   const DEADZONE_IN  = 0.15;
@@ -215,7 +215,7 @@ var createScene = async function () {
     root.metadata.isSpawnedModel = true;
     root.metadata.inst = inst;
     root.metadata.bottomOffset = 0;     // 贴地偏移
-    root.metadata.animPlaying = false;  // 动画播放开关(右摇杆短按切换)
+    root.metadata.animPlaying = false;  // 动画开关(由摇杆点击切换)
     return root;
   }
 
@@ -342,36 +342,47 @@ var createScene = async function () {
           });
         }
 
-        // 右摇杆:轴 + 点击(短按:锁定/切动画;长按:解锁)
+        // 右摇杆:一次点击 = 未锁定→锁定并开动;已锁定→停并解锁
         const stick = mc.getComponent("xr-standard-thumbstick");
         if (stick) {
           stick.onAxisValueChangedObservable.add((axes) => {
             stickX = axes.x || 0;
             stickY = axes.y || 0;
           });
+
+          let lastPressed = false; // 记录上一次 pressed 状态
+
           stick.onButtonStateChangedObservable.add(() => {
             const pressed = !!stick.pressed;
-            if (pressed && !stickPressed) {
-              stickPressed = true;
-              stickPressDownAt = performance.now();
-            } else if (!pressed && stickPressed) {
-              stickPressed = false;
-              const dur = performance.now() - stickPressDownAt;
-              const isLong = dur >= LONG_PRESS_MS;
 
-              if (isLong) {
-                // 长按:解锁
-                if (lockedRoot) unlockCurrent();
-              } else {
-                // 短按:未锁定则锁定;已锁定则切动画开/关
+            // 上升沿(false -> true)
+            if (pressed && !lastPressed) {
+              // 点击去抖:忽略过近的重复触发
+              const now = performance.now();
+              if (now - lastClickAt >= CLICK_DEBOUNCE_MS) {
+                lastClickAt = now;
+
                 if (!lockedRoot) {
-                  if (hoveredRoot) lockCurrentHovered();
+                  // 未锁定:若有悬停对象 → 锁定并开启动画
+                  if (hoveredRoot) {
+                    lockCurrentHovered();
+                    playMovingLoop(lockedRoot);
+                  }
                 } else {
-                  if (lockedRoot.metadata.animPlaying) stopToStatic(lockedRoot);
-                  else playMovingLoop(lockedRoot);
+                  // 已锁定:先停动画,再解锁,并清空移动态
+                  stopToStatic(lockedRoot);
+                  unlockCurrent();
+                  // 彻底停止移动 & 输入
+                  stickX = 0; stickY = 0;
+                  inputActive = false;
+                  curSpeed = 0;
+                  moveDir.set(0,0,0);
                 }
               }
             }
+
+            // 记录本次状态,用于边沿检测
+            lastPressed = pressed;
           });
         }
       }
@@ -397,7 +408,7 @@ var createScene = async function () {
       setHoveredRoot(root);
     }
 
-    // 锁定时:右摇杆控制移动(动画状态不受输入影响)
+    // 锁定时:右摇杆控制移动(动画状态只由点击控制)
     if (lockedRoot && rightCtrl) {
       const mag = Math.hypot(stickX, stickY);
       if (!inputActive) { if (mag > DEADZONE_IN) inputActive = true; }
