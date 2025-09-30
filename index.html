@@ -65,12 +65,17 @@
         var createDefaultEngine = function() { return new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true,  disableWebGL2Support: false}); };
         // ===== 配置你的 GLB 文件路径 =====
 const MODEL_URL = "./lp_robot.glb";
-// 大多数 GLTF 模型“向前”为 -Z;若你的模型向前是 +Z,把它改成 +1
+// 模型“前向”轴:大多数 GLB 是 -Z;若你的模型是 +Z,改为 +1
 const MODEL_FORWARD_SIGN = -1; // -1: -Z 前向(常见);+1: +Z 前向
+// 控制器 pointer 的“前向”轴:很多设备 pointer.Z 指向“背后”,因此默认 -1;如发现反了改 +1
+const CONTROLLER_FORWARD_SIGN = -1;
+
+// 移动时的朝向插值速度(弧度/秒)
+const ROT_LERP_SPEED = 10.0;
 
 var createScene = async function () {
   const scene = new BABYLON.Scene(engine);
-  scene.clearColor = new BABYLON.Color4(0, 0, 0, 0); // AR 透视
+  scene.clearColor = new BABYLON.Color4(0, 0, 0, 0);
 
   // --- Camera & Light ---
   const camera = new BABYLON.FreeCamera("camera1", new BABYLON.Vector3(0, 5, -6), scene);
@@ -87,10 +92,10 @@ var createScene = async function () {
   const gridMat = new BABYLON.GridMaterial("gridMat", scene);
   gridMat.gridRatio = 1.0;
   gridMat.majorUnitFrequency = 4;
-  gridMat.minorUnitVisibility = 0.9;               // 线更清晰
+  gridMat.minorUnitVisibility = 0.9;
   gridMat.lineColor = new BABYLON.Color3(1.0, 1.0, 1.0);
   gridMat.mainColor = new BABYLON.Color3(0, 0, 0);
-  gridMat.opacity = 0.03;                           // 留极小不透明以稳定渲染线条
+  gridMat.opacity = 0.03;
   gridMat.alpha = gridMat.opacity;
   gridMat.disableLighting = true;
   gridMat.transparencyMode = BABYLON.Material.MATERIAL_ALPHABLEND;
@@ -98,7 +103,7 @@ var createScene = async function () {
   gridMat.zOffset = -1;
   ground.material = gridMat;
 
-  // --- Highlight(悬停/锁定) ---
+  // --- Highlight ---
   const hl = new BABYLON.HighlightLayer("hl", scene);
   hl.innerGlow = false; hl.outerGlow = true;
   hl.blurHorizontalSize = 1.0; hl.blurVerticalSize = 1.0;
@@ -108,7 +113,7 @@ var createScene = async function () {
   const glbContainer = await BABYLON.SceneLoader.LoadAssetContainerAsync("", MODEL_URL, scene);
   glbContainer.removeAllFromScene();
 
-  // --- XR:AR 优先,VR 回退 & 禁用内置移动/传送 ---
+  // --- XR:AR 优先,VR 回退,禁用内置移动/传送 ---
   let xr;
   try {
     const supportsAR = await BABYLON.WebXRSessionManager.IsSessionSupportedAsync("immersive-ar");
@@ -143,12 +148,10 @@ var createScene = async function () {
   let rightCtrl = null, leftCtrl = null;
   let hoveredRoot = null, lockedRoot = null;
 
-  let stickX = 0, stickY = 0;
-  let stickIsDown = false;            // 摇杆按钮是否已按下(上升沿去抖)
-  let lastClickAt = 0;                // 点击时间戳
-  const CLICK_DEBOUNCE_MS = 250;      // 点击去抖窗口
+  let stickX = 0, stickY = 0;         // 注意:我们会把 Y 取反,保证“推前 = 前进”
+  let lastClickAt = 0;
+  const CLICK_DEBOUNCE_MS = 250;
 
-  // 连续移动(方向 + 标量速度)
   const DEADZONE_IN  = 0.15;
   const DEADZONE_OUT = 0.10;
   let   inputActive  = false;
@@ -160,19 +163,19 @@ var createScene = async function () {
   let   curSpeed  = 0.0;
   let   moveDir   = new BABYLON.Vector3(0,0,0);
 
-  // 生成防抖
   let rightTriggerDown = false;
   let lastSpawnAt = 0;
   const MIN_INTERVAL = 150;
 
-  // ====== 工具:拾取/贴地/朝向 ======
+  // ====== 工具 ======
   function rayFromController(ctrl, length = 100) {
     const origin = ctrl.pointer.position.clone();
-    const fwd = BABYLON.Vector3.TransformNormal(BABYLON.Axis.Z, ctrl.pointer.getWorldMatrix()).normalize();
+    const fwd = BABYLON.Vector3.TransformNormal(BABYLON.Axis.Z, ctrl.pointer.getWorldMatrix())
+                .scaleInPlace(CONTROLLER_FORWARD_SIGN)
+                .normalize();
     return new BABYLON.Ray(origin, fwd, length);
   }
 
-  // 计算世界包围盒最小/最大 Y
   function getWorldMinMaxY(root) {
     let minY = +Infinity, maxY = -Infinity;
     root.getChildMeshes().forEach((m) => {
@@ -184,7 +187,6 @@ var createScene = async function () {
     return { minY, maxY };
   }
 
-  // 将 root 的“底面(minY)”对齐到 groundY,并记录 bottomOffset
   function placeRootOnGround(root, groundY) {
     const { minY } = getWorldMinMaxY(root);
     const delta = groundY - minY;
@@ -192,14 +194,12 @@ var createScene = async function () {
     root.metadata.bottomOffset = (root.position.y - minY);
   }
 
-  // 高亮
   function setRootHighlight(root, on) {
     const meshes = root.getChildMeshes();
     if (on) meshes.forEach(m => hl.addMesh(m, HLCOLOR));
     else    meshes.forEach(m => hl.removeMesh(m));
   }
 
-  // 实例化 GLB
   function instantiateModel(name, scene) {
     const inst = glbContainer.instantiateModelsToScene((src) => `${name}_${src}`, false);
     const root = new BABYLON.TransformNode(`${name}_root`, scene);
@@ -214,12 +214,11 @@ var createScene = async function () {
     root.metadata = root.metadata || {};
     root.metadata.isSpawnedModel = true;
     root.metadata.inst = inst;
-    root.metadata.bottomOffset = 0;     // 贴地偏移
-    root.metadata.animPlaying = false;  // 动画开关(由摇杆点击切换)
+    root.metadata.bottomOffset = 0;
+    root.metadata.animPlaying = false;
     return root;
   }
 
-  // 动画控制
   function clipPick(groups, ks) {
     const kw = ks.map(k => k.toLowerCase());
     const out = groups.filter(g => kw.some(k => g.name.toLowerCase().includes(k)));
@@ -245,32 +244,42 @@ var createScene = async function () {
     root.metadata.animPlaying = true;
   }
 
-  // 让模型“正对用户”
   function faceUserYaw(root) {
     const cam = (xr && xr.baseExperience && xr.baseExperience.camera) || scene.activeCamera;
     if (!cam) return;
-    const dir = cam.globalPosition.subtract(root.position); // 模型→相机向量
+    const dir = cam.globalPosition.subtract(root.position);
     let yaw = Math.atan2(dir.x, dir.z);
-    if (MODEL_FORWARD_SIGN === +1) yaw += Math.PI; // 修正前向轴差异
+    if (MODEL_FORWARD_SIGN === +1) yaw += Math.PI;
     root.rotationQuaternion = null;
     root.rotation.y = yaw;
   }
 
-  // 生成实例
+  function angleDelta(a, b) {
+    let d = a - b;
+    while (d >  Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return d;
+  }
+  function faceDirYaw(root, dir, dt) {
+    if (!root || dir.lengthSquared() < 1e-6) return;
+    // 目标 yaw 取决于“希望面向的世界方向”
+    const yawTarget = (MODEL_FORWARD_SIGN === +1)
+      ? Math.atan2(dir.x, dir.z) + Math.PI
+      : Math.atan2(dir.x, dir.z);
+    root.rotationQuaternion = null;
+    const yawNow = root.rotation.y || 0;
+    const maxStep = ROT_LERP_SPEED * dt;
+    const d = angleDelta(yawTarget, yawNow);
+    root.rotation.y = Math.abs(d) <= maxStep ? yawTarget : yawNow + Math.sign(d) * maxStep;
+  }
+
   function spawnModelAt(point) {
     const root = instantiateModel("spawnedModel", scene);
-
-    // 放置到点 & 面向用户
     root.position.copyFrom(point);
     faceUserYaw(root);
-
-    // 贴地(包围盒底对齐地面)
     placeRootOnGround(root, ground.position.y);
-
-    // 初始静态
     stopToStatic(root);
 
-    // 弹入动画
     root.scaling.set(0.01,0.01,0.01);
     BABYLON.Animation.CreateAndStartAnimation(
       "popIn", root, "scaling", 60, 10,
@@ -280,33 +289,11 @@ var createScene = async function () {
     return root;
   }
 
-  // 悬停/锁定
-  function setHoveredRoot(rootOrNull) {
-    if (lockedRoot) return;
-    if (hoveredRoot === rootOrNull) return;
-    if (hoveredRoot) setRootHighlight(hoveredRoot, false);
-    hoveredRoot = rootOrNull || null;
-    if (hoveredRoot) setRootHighlight(hoveredRoot, true);
-  }
-  function lockCurrentHovered() {
-    if (!hoveredRoot) return;
-    setRootHighlight(hoveredRoot, false);
-    lockedRoot = hoveredRoot;
-    hoveredRoot = null;
-    setRootHighlight(lockedRoot, true);
-  }
-  function unlockCurrent() {
-    if (!lockedRoot) return;
-    setRootHighlight(lockedRoot, false);
-    lockedRoot = null;
-  }
-
-  // 控制器 yaw 的水平基向量
   const tmpR = new BABYLON.Vector3(), tmpF = new BABYLON.Vector3();
   function horizontalBasis(ctrl) {
     const m = ctrl.pointer.getWorldMatrix();
     tmpR.copyFrom(BABYLON.Vector3.TransformNormal(BABYLON.Axis.X, m));
-    tmpF.copyFrom(BABYLON.Vector3.TransformNormal(BABYLON.Axis.Z, m)).scaleInPlace(-1);
+    tmpF.copyFrom(BABYLON.Vector3.TransformNormal(BABYLON.Axis.Z, m)).scaleInPlace(CONTROLLER_FORWARD_SIGN);
     tmpR.y = 0; tmpF.y = 0;
     if (tmpR.lengthSquared() < 1e-6) tmpR.copyFrom(BABYLON.Axis.X);
     if (tmpF.lengthSquared() < 1e-6) tmpF.copyFrom(BABYLON.Axis.Z);
@@ -346,33 +333,29 @@ var createScene = async function () {
         const stick = mc.getComponent("xr-standard-thumbstick");
         if (stick) {
           stick.onAxisValueChangedObservable.add((axes) => {
+            // ★ 把 Y 取反:推前(原本负) → 正值,便于“前进为正”
             stickX = axes.x || 0;
-            stickY = axes.y || 0;
+            stickY = -(axes.y || 0);
           });
 
-          let lastPressed = false; // 记录上一次 pressed 状态
-
+          let lastPressed = false;
           stick.onButtonStateChangedObservable.add(() => {
             const pressed = !!stick.pressed;
 
-            // 上升沿(false -> true)
             if (pressed && !lastPressed) {
-              // 点击去抖:忽略过近的重复触发
               const now = performance.now();
               if (now - lastClickAt >= CLICK_DEBOUNCE_MS) {
                 lastClickAt = now;
 
                 if (!lockedRoot) {
-                  // 未锁定:若有悬停对象 → 锁定并开启动画
                   if (hoveredRoot) {
                     lockCurrentHovered();
                     playMovingLoop(lockedRoot);
                   }
                 } else {
-                  // 已锁定:先停动画,再解锁,并清空移动态
+                  // 停动画并解锁,同时清零移动
                   stopToStatic(lockedRoot);
                   unlockCurrent();
-                  // 彻底停止移动 & 输入
                   stickX = 0; stickY = 0;
                   inputActive = false;
                   curSpeed = 0;
@@ -380,8 +363,6 @@ var createScene = async function () {
                 }
               }
             }
-
-            // 记录本次状态,用于边沿检测
             lastPressed = pressed;
           });
         }
@@ -408,7 +389,7 @@ var createScene = async function () {
       setHoveredRoot(root);
     }
 
-    // 锁定时:右摇杆控制移动(动画状态只由点击控制)
+    // 锁定:摇杆控制移动;朝向 = 目标方向(而非位移方向)
     if (lockedRoot && rightCtrl) {
       const mag = Math.hypot(stickX, stickY);
       if (!inputActive) { if (mag > DEADZONE_IN) inputActive = true; }
@@ -416,30 +397,40 @@ var createScene = async function () {
 
       const { right: R, fwd: F } = horizontalBasis(rightCtrl);
 
-      let targetDir = moveDir.clone();
-      let targetSpeed = 0;
-
+      // 目标方向:直接由摇杆决定(不等速度平滑)
+      let targetDir = new BABYLON.Vector3(0,0,0);
       if (inputActive) {
-        targetDir = R.scale(stickX).addInPlace(F.scale(stickY));
+        targetDir.copyFrom(R).scaleInPlace(stickX).addInPlace(F.scale(stickY));
         targetDir.y = 0;
         if (targetDir.lengthSquared() > 1e-6) targetDir.normalize();
-        targetSpeed = MAX_SPEED * Math.min(1, mag);
       }
 
-      if (targetDir.lengthSquared() > 1e-6) {
+      // ★ 只要有输入,就立刻按“目标方向”平滑朝向
+      if (inputActive && targetDir.lengthSquared() > 1e-6) {
+        faceDirYaw(lockedRoot, targetDir, dt);
+      }
+
+      // 位移方向/速度仍然使用平滑的 moveDir / curSpeed
+      let targetSpeed = 0;
+      if (inputActive && targetDir.lengthSquared() > 1e-6) {
+        // 方向平滑
         const a = Math.min(1, DIR_LERP * dt);
         moveDir.x += (targetDir.x - moveDir.x) * a;
         moveDir.z += (targetDir.z - moveDir.z) * a;
         if (moveDir.lengthSquared() > 1e-6) moveDir.normalize();
+
+        targetSpeed = MAX_SPEED * Math.min(1, mag);
       }
+
+      // 速度平滑
       const accel = inputActive ? ACCEL_ON : ACCEL_OFF;
       curSpeed += (targetSpeed - curSpeed) * Math.min(1, accel * dt);
 
+      // 位置更新 + 贴地
       if (curSpeed > 1e-4 && moveDir.lengthSquared() > 1e-6) {
         const delta = moveDir.scale(curSpeed * dt);
         const newPos = lockedRoot.position.add(delta);
         const bottomOffset = lockedRoot.metadata.bottomOffset ?? 0;
-        // 贴地:保持底部与地面对齐
         newPos.y = ground.position.y + bottomOffset;
         lockedRoot.position.copyFrom(newPos);
       }
