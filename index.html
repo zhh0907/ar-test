@@ -64,7 +64,7 @@
         var sceneToRender = null;
         var createDefaultEngine = function() { return new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true,  disableWebGL2Support: false}); };
         // ===== 配置你的 GLB 文件路径 =====
-const MODEL_URL = "/models/myModel.glb";
+const MODEL_URL = "./lp_robot.glb";
 // 大多数 GLTF 模型“向前”为 -Z;若你的模型向前是 +Z,把它改成 +1
 const MODEL_FORWARD_SIGN = -1; // -1: -Z 前向(常见);+1: +Z 前向
 
