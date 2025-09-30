@@ -89,7 +89,7 @@ var createScene = async function () {
   gridMat.minorUnitVisibility = 6;       // 细网格可见度(高一些=线更“粗”)
   gridMat.lineColor = new BABYLON.Color3(0.0, 0.95, 0.55); // 明亮但不发光
   gridMat.mainColor = new BABYLON.Color3(0, 0, 0);         // 面色深色衬托
-  gridMat.opacity = 5;                  // 面半透明(别太高以免挡视野)
+  gridMat.opacity = 2;                  // 面半透明(别太高以免挡视野)
   gridMat.transparencyMode = BABYLON.Material.MATERIAL_ALPHABLEND;
   gridMat.backFaceCulling = false;
   gridMat.zOffset = -1;
