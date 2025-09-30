@@ -1,0 +1,374 @@
+<!doctype html>
+<html>
+    <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+
+        <title>Babylon.js sample code</title>
+
+        <!-- Babylon.js -->
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.6.2/dat.gui.min.js"></script>
+        <script src="https://assets.babylonjs.com/generated/Assets.js"></script>
+        <script src="https://cdn.babylonjs.com/recast.js"></script>
+        <script src="https://cdn.babylonjs.com/ammo.js"></script>
+        <script src="https://cdn.babylonjs.com/havok/HavokPhysics_umd.js"></script>
+        <script src="https://cdn.babylonjs.com/cannon.js"></script>
+        <script src="https://cdn.babylonjs.com/Oimo.js"></script>
+        <script src="https://cdn.babylonjs.com/earcut.min.js"></script>
+        <script src="https://cdn.babylonjs.com/babylon.js"></script>
+        <script src="https://cdn.babylonjs.com/materialsLibrary/babylonjs.materials.min.js"></script>
+        <script src="https://cdn.babylonjs.com/proceduralTexturesLibrary/babylonjs.proceduralTextures.min.js"></script>
+        <script src="https://cdn.babylonjs.com/postProcessesLibrary/babylonjs.postProcess.min.js"></script>
+        <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.js"></script>
+        <script src="https://cdn.babylonjs.com/serializers/babylonjs.serializers.min.js"></script>
+        <script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js"></script>
+        <script src="https://cdn.babylonjs.com/addons/babylonjs.addons.min.js"></script>
+        <script src="https://cdn.babylonjs.com/inspector/babylon.inspector.bundle.js"></script>
+
+        <style>
+            html,
+            body {
+                overflow: hidden;
+                width: 100%;
+                height: 100%;
+                margin: 0;
+                padding: 0;
+            }
+
+            #renderCanvas {
+                width: 100%;
+                height: 100%;
+                touch-action: none;
+            }
+
+            #canvasZone {
+                width: 100%;
+                height: 100%;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="canvasZone"><canvas id="renderCanvas"></canvas></div>
+        <script>
+                    var canvas = document.getElementById("renderCanvas");
+
+                    var startRenderLoop = function (engine, canvas) {
+                        engine.runRenderLoop(function () {
+                            if (sceneToRender && sceneToRender.activeCamera) {
+                                sceneToRender.render();
+                            }
+                        });
+                    }
+
+                    var engine = null;
+        var scene = null;
+        var sceneToRender = null;
+        var createDefaultEngine = function() { return new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true,  disableWebGL2Support: false}); };
+        var createScene = async function () {
+  const scene = new BABYLON.Scene(engine);
+
+  // --- Camera & Light(桌面测试用的自由相机) ---
+  const camera = new BABYLON.FreeCamera("cam", new BABYLON.Vector3(0, 1.6, -3), scene);
+  camera.setTarget(BABYLON.Vector3.Zero());
+  camera.attachControl(canvas, true);
+
+  const light = new BABYLON.HemisphericLight("hemi", new BABYLON.Vector3(0, 1, 0), scene);
+  light.intensity = 0.8;
+
+  // --- 环境(PC/VR 测试;AR 时隐藏) ---
+  const env = scene.createDefaultEnvironment({
+    enableGroundShadow: false,
+    createSkybox: true,
+    createGround: true,
+    groundSize: 20
+  });
+  if (env?.ground) {
+    env.ground.isPickable = true;
+    env.ground.position.y = 0;
+  }
+
+  // --- 准星 ---
+  const reticle = BABYLON.MeshBuilder.CreateTorus("reticle", {
+    diameter: 0.12,
+    thickness: 0.006,
+    tessellation: 48
+  }, scene);
+  reticle.rotationQuaternion = BABYLON.Quaternion.FromEulerAngles(Math.PI / 2, 0, 0);
+  const retMat = new BABYLON.StandardMaterial("retMat", scene);
+  retMat.emissiveColor = new BABYLON.Color3(0.1, 0.9, 0.9);
+  retMat.disableLighting = true;
+  reticle.material = retMat;
+  reticle.isPickable = false;
+  reticle.setEnabled(false);
+
+  // --- 生成 Box(含锚点限流) ---
+  let spawnCount = 0;
+  const MAX_SPAWNS = 30;
+
+  async function spawnBoxAt(position, rotationQuaternion, anchorSystem, useAnchor) {
+    if (spawnCount >= MAX_SPAWNS) return;
+
+    const box = BABYLON.MeshBuilder.CreateBox("spawnBox", { size: 0.15 }, scene);
+    const mat = new BABYLON.StandardMaterial("boxMat", scene);
+    mat.diffuseColor = new BABYLON.Color3(0.1, 0.3, 0.95);
+    mat.specularColor = new BABYLON.Color3(0.2, 0.2, 0.2);
+    box.material = mat;
+
+    try {
+      if (useAnchor && anchorSystem?.isEnabled) {
+        const anchor = await anchorSystem.addAnchorAtPositionAndRotation(
+          position,
+          rotationQuaternion || BABYLON.Quaternion.Identity()
+        );
+        if (anchor?.attachedNode) box.setParent(anchor.attachedNode);
+        else {
+          box.position.copyFrom(position);
+          if (rotationQuaternion) box.rotationQuaternion = rotationQuaternion.clone();
+        }
+      } else {
+        box.position.copyFrom(position);
+        if (rotationQuaternion) box.rotationQuaternion = rotationQuaternion.clone();
+      }
+      spawnCount++;
+    } catch (e) {
+      box.position.copyFrom(position);
+      if (rotationQuaternion) box.rotationQuaternion = rotationQuaternion.clone();
+      spawnCount++;
+    }
+  }
+
+  // =========================================================
+  // ===================== WebXR 统一初始化 ===================
+  // =========================================================
+  // 不强制 sessionMode,交由 Playground 的按钮决定(VR/AR 都能用)
+  const xr = await scene.createDefaultXRExperienceAsync({
+    disableDefaultUI: false,
+    optionalFeatures: true
+  });
+
+  const fm = xr.baseExperience.featuresManager;
+
+  // 可能启用的特性
+  let hitTest = null;        // 仅用于 AR
+  let anchorSystem = null;   // 仅用于 AR
+  let pointerSelection = null; // VR/AR 都可用(控制器射线拾取)
+
+  // 运行时状态
+  let inXR = false;
+  let isAR = false; // immersive-ar?
+  let lastHitPose = null;
+
+  // 进入/退出 XR:按模式切换可见性 & 启用特性
+  xr.baseExperience.onStateChangedObservable.add((state) => {
+    inXR = (state === BABYLON.WebXRState.IN_XR || state === BABYLON.WebXRState.ENTERING_XR);
+
+    if (!inXR) {
+      // 回到桌面
+      if (env?.ground) env.ground.isVisible = true;
+      if (env?.skybox) env.skybox.isVisible = true;
+      reticle.setEnabled(false);
+      lastHitPose = null;
+      return;
+    }
+
+    // 进入 XR 后再判断模式
+    const mode = xr.baseExperience.sessionManager.sessionMode || "";
+    isAR = (mode === "immersive-ar");
+
+    // AR:隐藏环境;VR:保留环境用于拾取
+    if (env?.ground) env.ground.isVisible = !isAR ? true : false;
+    if (env?.skybox) env.skybox.isVisible = !isAR ? true : false;
+
+    // 启用/关闭特性(只启一次即可)
+    try {
+      if (!pointerSelection) {
+        pointerSelection = fm.enableFeature(BABYLON.WebXRFeatureName.POINTER_SELECTION, "latest", {
+          xrInput: xr.input,
+          enablePointerSelectionOnAllControllers: true
+        });
+      }
+    } catch (e) {
+      console.warn("POINTER_SELECTION enable failed:", e);
+    }
+
+    if (isAR) {
+      // AR:启用 Hit Test + Anchor
+      try {
+        if (!hitTest) {
+          hitTest = fm.enableFeature(BABYLON.WebXRFeatureName.HIT_TEST, "latest", {
+            // viewer ray 最稳
+            offsetRay: new BABYLON.Ray(new BABYLON.Vector3(0, 0, 0), new BABYLON.Vector3(0, 0, -1), 1.0),
+            enableTransientHitTest: true
+          });
+          hitTest.onHitTestResultObservable.add(results => {
+            if (results && results.length > 0) {
+              const r = results[0];
+              lastHitPose = {
+                position: r.position.clone(),
+                rotationQuaternion: r.rotationQuaternion ? r.rotationQuaternion.clone() : BABYLON.Quaternion.Identity()
+              };
+              reticle.setEnabled(true);
+              reticle.position.copyFrom(lastHitPose.position);
+              reticle.rotationQuaternion = BABYLON.Quaternion.FromEulerAngles(Math.PI / 2, 0, 0);
+            } else {
+              lastHitPose = null;
+              reticle.setEnabled(false);
+            }
+          });
+        }
+      } catch (e) {
+        console.warn("HIT_TEST enable failed:", e);
+      }
+
+      try {
+        if (!anchorSystem) {
+          anchorSystem = fm.enableFeature(BABYLON.WebXRFeatureName.ANCHOR_SYSTEM, "latest", {});
+        }
+      } catch (e) {
+        console.warn("ANCHOR_SYSTEM enable failed:", e);
+      }
+    } else {
+      // VR:不用 hitTest / anchor;用控制器射线做拾取(在 onSelectStart 里实现)
+      reticle.setEnabled(false);
+      lastHitPose = null;
+    }
+  });
+
+  // =========================================================
+  // ============= 统一的“点击/扳机”生成逻辑 =================
+  // =========================================================
+  xr.input.onControllerAddedObservable.add(controller => {
+    // 统一一次性点击事件(屏幕点击、手柄扳机)
+    controller.onSelectStartObservable.add(() => {
+      if (isAR) {
+        // AR:优先用 hitTest
+        if (lastHitPose) {
+          spawnBoxAt(lastHitPose.position, lastHitPose.rotationQuaternion, anchorSystem, /*useAnchor*/ true);
+          return;
+        }
+      }
+
+      // VR 或 AR 无 hit:用控制器射线对 ground 拾取
+      // controller.pointer 是一个 TransformNode,指向“前方”
+      const pointerNode = controller.pointer || controller.grip || null;
+      if (pointerNode) {
+        const origin = pointerNode.getAbsolutePosition ? pointerNode.getAbsolutePosition() : pointerNode.absolutePosition || pointerNode.position;
+        const forward = pointerNode.getDirection ? pointerNode.getDirection(BABYLON.Axis.Z) : new BABYLON.Vector3(0, 0, 1);
+        const ray = new BABYLON.Ray(origin, forward, 20);
+
+        const pick = scene.pickWithRay(ray, (mesh) => {
+          // VR 时通常用地面当落点;如需也允许打到其它 mesh,可在此扩展
+          return mesh === env?.ground;
+        });
+
+        if (pick?.hit && pick.pickedPoint) {
+          spawnBoxAt(pick.pickedPoint, BABYLON.Quaternion.Identity(), /*anchor*/ null, /*useAnchor*/ false);
+          // 同步一个可视化的准星位置(可选)
+          reticle.setEnabled(true);
+          reticle.position.copyFrom(pick.pickedPoint);
+          reticle.rotationQuaternion = BABYLON.Quaternion.FromEulerAngles(Math.PI / 2, 0, 0);
+          return;
+        } else {
+          // 没打到地面:在控制器前方 1.2m 处兜底生成
+          const fallbackPos = origin.add(forward.scale(1.2));
+          spawnBoxAt(fallbackPos, BABYLON.Quaternion.Identity(), null, false);
+          return;
+        }
+      }
+
+      // 没有 pointerNode(极少见):在相机前方兜底
+      const fallback = camera.position.add(camera.getDirection(BABYLON.Axis.Z).scale(1.5));
+      spawnBoxAt(fallback, BABYLON.Quaternion.Identity(), null, false);
+    });
+
+    // 真·手柄(扳机上升沿去抖,避免“连发”)
+    controller.onMotionControllerInitObservable.add(mc => {
+      if (mc?.handedness === "right") {
+        const triggerId = mc.getComponentIds().find(id => id.indexOf("trigger") !== -1) || "xr-standard-trigger";
+        const trigger = mc.getComponent(triggerId);
+        if (!trigger) return;
+
+        let ready = true;
+        trigger.onButtonStateChangedObservable.add(c => {
+          const val = (typeof c.value === "number") ? c.value : 1.0;
+          if (c.pressed && ready && val >= 0.9) {
+            ready = false;
+            // 触发一次,沿用与 onSelectStart 同样的逻辑
+            controller.onSelectStartObservable.notifyObservers(controller);
+          }
+          if (!c.pressed) ready = true;
+        });
+      }
+    });
+  });
+
+  // =========================================================
+  // =============== PC / 无手柄 测试逻辑 =====================
+  // =========================================================
+  const pickGroundAndUpdateReticle = (x, y) => {
+    if (!env?.ground) return;
+    const pick = scene.pick(x, y, mesh => mesh === env.ground);
+    if (pick && pick.hit) {
+      reticle.setEnabled(true);
+      reticle.position.copyFrom(pick.pickedPoint);
+      reticle.rotationQuaternion = BABYLON.Quaternion.FromEulerAngles(Math.PI / 2, 0, 0);
+      lastHitPose = {
+        position: pick.pickedPoint.clone(),
+        rotationQuaternion: BABYLON.Quaternion.Identity()
+      };
+    } else {
+      if (!inXR) {
+        reticle.setEnabled(false);
+        lastHitPose = null;
+      }
+    }
+  };
+
+  scene.onPointerMove = () => {
+    if (!inXR) pickGroundAndUpdateReticle(scene.pointerX, scene.pointerY);
+  };
+
+  scene.onPointerDown = (evt) => {
+    if (!inXR) {
+      if (evt.button === 0 && lastHitPose) {
+        spawnBoxAt(lastHitPose.position, lastHitPose.rotationQuaternion, null, false);
+      }
+    }
+  };
+
+  reticle.setEnabled(false);
+  return scene;
+};
+
+                window.initFunction = async function() {
+                    
+                    
+                    
+                    var asyncEngineCreation = async function() {
+                        try {
+                        return createDefaultEngine();
+                        } catch(e) {
+                        console.log("the available createEngine function failed. Creating the default engine instead");
+                        return createDefaultEngine();
+                        }
+                    }
+
+                    window.engine = await asyncEngineCreation();
+                    
+                    const engineOptions = window.engine.getCreationOptions?.();
+                    if (!engineOptions || engineOptions.audioEngine !== false) {
+                        
+                    }
+        if (!engine) throw 'engine should not be null.';
+        startRenderLoop(engine, canvas);
+        window.scene = createScene();};
+        initFunction().then(() => {scene.then(returnedScene => { sceneToRender = returnedScene; });
+        
+                    });
+
+                    // Resize
+                    window.addEventListener("resize", function () {
+                        engine.resize();
+                    });
+        </script>
+    </body>
+</html>
