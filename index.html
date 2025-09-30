@@ -147,7 +147,6 @@ var createScene = async function () {
   let hoveredRoot = null, lockedRoot = null;
 
   let stickX = 0, stickY = 0;
-  let stickIsDown = false;            // 摇杆按钮是否已按下(上升沿去抖)
   let lastClickAt = 0;                // 点击时间戳
   const CLICK_DEBOUNCE_MS = 250;      // 点击去抖窗口
 
@@ -175,6 +174,47 @@ var createScene = async function () {
     return new BABYLON.Ray(origin, fwd, length);
   }
 
+  // 角度差正规化到 [-PI, PI],用于平滑旋转
+  function angleDelta(a, b) {
+    let d = a - b;
+    while (d >  Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return d;
+  }
+
+  // 根据世界方向 dir 让 root 水平朝向(平滑)
+  function faceDirSmooth(root, dir, dt) {
+    if (!root || dir.lengthSquared() < 1e-6) return;
+    const yawTarget = (MODEL_FORWARD_SIGN === +1)
+      ? Math.atan2(dir.x, dir.z) + Math.PI
+      : Math.atan2(dir.x, dir.z);
+    root.rotationQuaternion = null;
+    const yawNow = root.rotation.y || 0;
+    const maxStep = ROT_LERP_SPEED * dt;
+    const d = angleDelta(yawTarget, yawNow);
+    root.rotation.y = Math.abs(d) <= maxStep ? yawTarget : yawNow + Math.sign(d) * maxStep;
+  }
+
+  // 根据世界方向 dir 让 root 立即朝向(无插值)
+  function faceDirImmediate(root, dir) {
+    if (!root || dir.lengthSquared() < 1e-6) return;
+    let yaw = Math.atan2(dir.x, dir.z);
+    if (MODEL_FORWARD_SIGN === +1) yaw += Math.PI;
+    root.rotationQuaternion = null;
+    root.rotation.y = yaw;
+  }
+
+  // 让模型“正对用户”(仅生成时)
+  function faceUserYaw(root) {
+    const cam = (xr && xr.baseExperience && xr.baseExperience.camera) || scene.activeCamera;
+    if (!cam) return;
+    const dir = cam.globalPosition.subtract(root.position); // 模型→相机向量
+    let yaw = Math.atan2(dir.x, dir.z);
+    if (MODEL_FORWARD_SIGN === +1) yaw += Math.PI;
+    root.rotationQuaternion = null;
+    root.rotation.y = yaw;
+  }
+
   // 计算世界包围盒最小/最大 Y
   function getWorldMinMaxY(root) {
     let minY = +Infinity, maxY = -Infinity;
@@ -195,6 +235,17 @@ var createScene = async function () {
     root.metadata.bottomOffset = (root.position.y - minY);
   }
 
+  // ---- 关键修复:优先使用子网格 metadata.spawnedRoot 指针;无则再向上找“生成根” ----
+  function findSpawnedRoot(node) {
+    let cur = node;
+    while (cur) {
+      if (cur.metadata && cur.metadata.spawnedRoot) return cur.metadata.spawnedRoot;
+      if (cur.metadata && cur.metadata.isSpawnedModel) return cur;
+      cur = cur.parent;
+    }
+    return null;
+  }
+
   // 高亮
   function setRootHighlight(root, on) {
     const meshes = root.getChildMeshes();
@@ -206,9 +257,15 @@ var createScene = async function () {
   function instantiateModel(name, scene) {
     const inst = glbContainer.instantiateModelsToScene((src) => `${name}_${src}`, false);
     const root = new BABYLON.TransformNode(`${name}_root`, scene);
-    inst.rootNodes.forEach((n) => { n.parent = root; });
 
-    root.getChildMeshes().forEach((m) => {
+    // 统一接入节点树
+    inst.rootNodes.forEach((n) => {
+      n.parent = root;
+    });
+
+    // —— 保证每个可拾取子网格都带有 spawnedRoot 指针(关键修复)——
+    const meshes = root.getChildMeshes();
+    meshes.forEach((m) => {
       m.isPickable = true;
       m.metadata = m.metadata || {};
       m.metadata.spawnedRoot = root;
@@ -248,47 +305,6 @@ var createScene = async function () {
     root.metadata.animPlaying = true;
   }
 
-  // 让模型“正对用户”(仅生成时)
-  function faceUserYaw(root) {
-    const cam = (xr && xr.baseExperience && xr.baseExperience.camera) || scene.activeCamera;
-    if (!cam) return;
-    const dir = cam.globalPosition.subtract(root.position); // 模型→相机向量
-    let yaw = Math.atan2(dir.x, dir.z);
-    if (MODEL_FORWARD_SIGN === +1) yaw += Math.PI; // 修正前向轴差异
-    root.rotationQuaternion = null;
-    root.rotation.y = yaw;
-  }
-
-  // 角度差正规化到 [-PI, PI],用于平滑旋转
-  function angleDelta(a, b) {
-    let d = a - b;
-    while (d >  Math.PI) d -= Math.PI * 2;
-    while (d < -Math.PI) d += Math.PI * 2;
-    return d;
-  }
-
-  // 根据世界方向 dir 让 root 水平朝向(平滑)
-  function faceDirSmooth(root, dir, dt) {
-    if (!root || dir.lengthSquared() < 1e-6) return;
-    const yawTarget = (MODEL_FORWARD_SIGN === +1)
-      ? Math.atan2(dir.x, dir.z) + Math.PI
-      : Math.atan2(dir.x, dir.z);
-    root.rotationQuaternion = null;
-    const yawNow = root.rotation.y || 0;
-    const maxStep = ROT_LERP_SPEED * dt;
-    const d = angleDelta(yawTarget, yawNow);
-    root.rotation.y = Math.abs(d) <= maxStep ? yawTarget : yawNow + Math.sign(d) * maxStep;
-  }
-
-  // 根据世界方向 dir 让 root 立即朝向(无插值)
-  function faceDirImmediate(root, dir) {
-    if (!root || dir.lengthSquared() < 1e-6) return;
-    let yaw = Math.atan2(dir.x, dir.z);
-    if (MODEL_FORWARD_SIGN === +1) yaw += Math.PI;
-    root.rotationQuaternion = null;
-    root.rotation.y = yaw;
-  }
-
   // 控制器 yaw 的水平基向量
   const tmpR = new BABYLON.Vector3(), tmpF = new BABYLON.Vector3(), tmpStickDir = new BABYLON.Vector3();
   function horizontalBasis(ctrl) {
@@ -301,7 +317,7 @@ var createScene = async function () {
     tmpR.normalize(); tmpF.normalize();
     return { right: tmpR, fwd: tmpF };
   }
-  // 用摇杆输入得到“世界坐标的”水平方向(用于朝向)
+  // 用摇杆输入得到“世界坐标的”水平方向(用于朝向/移动)
   function worldDirFromStick(ctrl, sx, sy) {
     const { right: R, fwd: F } = horizontalBasis(ctrl);
     tmpStickDir.copyFrom(R).scaleInPlace(sx).addInPlace(F.scale(sy));
@@ -408,7 +424,7 @@ var createScene = async function () {
                     lockCurrentHovered();
                     playMovingLoop(lockedRoot);
 
-                    // ★ 新增:锁定瞬间,若摇杆有方向,立即转向该方向
+                    // 锁定瞬间,若摇杆有方向,立即转向该方向
                     const dir = worldDirFromStick(rightCtrl, stickX, stickY);
                     if (dir.lengthSquared() > 1e-6) {
                       faceDirImmediate(lockedRoot, dir);
@@ -446,27 +462,30 @@ var createScene = async function () {
   scene.onBeforeRenderObservable.add(() => {
     const dt = scene.getEngine().getDeltaTime() / 1000;
 
-    // 悬停(未锁定)
+    // 悬停(未锁定)— 仅允许命中“已生成模型的网格或地面”(关键修复)
     if (!lockedRoot && rightCtrl) {
       const ray = rayFromController(rightCtrl);
-      const pick = scene.pickWithRay(ray, (m) => !!m.metadata?.spawnedRoot);
-      const root = pick?.hit ? pick.pickedMesh.metadata.spawnedRoot : null;
+      const pick = scene.pickWithRay(
+        ray,
+        (m) => m === ground || (m && m.metadata && (m.metadata.spawnedRoot || m.metadata.isSpawnedModel))
+      );
+      const root = (pick?.hit && pick.pickedMesh !== ground) ? findSpawnedRoot(pick.pickedMesh) : null;
       setHoveredRoot(root);
     }
 
-    // 锁定时:右摇杆控制移动(动画状态只由点击控制)
+    // 锁定时:右摇杆控制移动(动画状态只由点击控制)+ 朝向摇杆方向
     if (lockedRoot && rightCtrl) {
       const mag = Math.hypot(stickX, stickY);
       if (!inputActive) { if (mag > DEADZONE_IN) inputActive = true; }
       else              { if (mag < DEADZONE_OUT) inputActive = false; }
 
-      // ★ 无论是否在“位移”,都用摇杆方向来控制朝向(避免再朝向你)
+      // 无论是否在“位移”,都用摇杆方向来控制朝向
       const stickDir = worldDirFromStick(rightCtrl, stickX, stickY);
       if (stickDir.lengthSquared() > 1e-6) {
         faceDirSmooth(lockedRoot, stickDir, dt);
       }
 
-      // 位移逻辑(与朝向分离)
+      // 位移逻辑
       const { right: R, fwd: F } = horizontalBasis(rightCtrl);
       let targetDir = moveDir.clone();
       let targetSpeed = 0;
