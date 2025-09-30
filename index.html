@@ -111,6 +111,37 @@ var createScene = async function () {
   const glbContainer = await BABYLON.SceneLoader.LoadAssetContainerAsync("", MODEL_URL, scene);
   glbContainer.removeAllFromScene();
 
+  // --- XR:AR 优先,VR 回退 & 禁用内置移动/传送 ---
+  let xr;
+  try {
+    const supportsAR = await BABYLON.WebXRSessionManager.IsSessionSupportedAsync("immersive-ar");
+    if (!supportsAR) throw new Error("no AR");
+    xr = await scene.createDefaultXRExperienceAsync({
+      sessionMode: "immersive-ar",
+      referenceSpaceType: "local-floor",
+      uiOptions: { sessionMode: "immersive-ar" },
+      optionalFeatures: true
+    });
+    xr.baseExperience.featuresManager.enableFeature(
+      BABYLON.WebXRBackgroundRemover.Name, "latest",
+      { environmentHelperRemoval: true, skyBoxRemoval: true }
+    );
+    const fm = xr.baseExperience.featuresManager;
+    try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); } catch {}
+    try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION); } catch {}
+  } catch {
+    xr = await scene.createDefaultXRExperienceAsync({
+      sessionMode: "immersive-vr",
+      referenceSpaceType: "local-floor",
+      uiOptions: { sessionMode: "immersive-vr" }
+    });
+    scene.createDefaultEnvironment({ createGround:false, createSkybox:true, enableGroundShadow:true });
+    scene.clearColor = new BABYLON.Color4(0,0,0,1);
+    const fm = xr.baseExperience.featuresManager;
+    try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); } catch {}
+    try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION); } catch {}
+  }
+
   // ====== 状态 ======
   let rightCtrl = null, leftCtrl = null;
   let hoveredRoot = null, lockedRoot = null;
@@ -136,7 +167,7 @@ var createScene = async function () {
   const MIN_INTERVAL = 150;
 
   // === 新增:全局已生成网格集合(强保证拾取) ===
-  const spawnedMeshes = new Set();   // 存放 AbstractMesh
+  const spawnedMeshes = new Set();   // 存放 AbstractMesh(只放生成物的网格)
   const spawnedRoots  = new Set();   // 可选:根集合(备用)
 
   // ====== 工具:拾取/贴地/朝向 ======
@@ -176,7 +207,7 @@ var createScene = async function () {
   function faceUserYaw(root) {
     const cam = (xr && xr.baseExperience && xr.baseExperience.camera) || scene.activeCamera;
     if (!cam) return;
-    const dir = cam.globalPosition.subtract(root.position);
+    const dir = cam.globalPosition.subtract(root.position); // 模型→相机向量
     let yaw = Math.atan2(dir.x, dir.z);
     if (MODEL_FORWARD_SIGN === +1) yaw += Math.PI;
     root.rotationQuaternion = null;
@@ -201,7 +232,7 @@ var createScene = async function () {
     root.metadata.bottomOffset = (root.position.y - minY);
   }
 
-  // —— 回溯“生成根”:先看自身是否标了 isSpawnedModel;否则向上找 —— 
+  // —— 回溯“生成根”:看是否到达带 isSpawnedModel 标记的 TransformNode —— 
   function findSpawnedRoot(node) {
     let cur = node;
     while (cur) {
@@ -221,16 +252,17 @@ var createScene = async function () {
   function instantiateModel(name, scene) {
     const inst = glbContainer.instantiateModelsToScene((src) => `${name}_${src}`, false);
     const root = new BABYLON.TransformNode(`${name}_root`, scene);
+
     root.metadata = root.metadata || {};
     root.metadata.isSpawnedModel = true;
     root.metadata.inst = inst;
     root.metadata.bottomOffset = 0;
     root.metadata.animPlaying = false;
 
-    // 挂到统一根
+    // 将 glb 的各 rootNodes 接入统一根
     inst.rootNodes.forEach((n) => { n.parent = root; });
 
-    // 关键:把所有子网格加入 spawnedMeshes(稳定拾取集合)
+    // 把所有子网格加入 spawnedMeshes(稳定拾取集合)
     root.getChildMeshes().forEach((m) => {
       m.isPickable = true;
       spawnedMeshes.add(m);
@@ -409,14 +441,12 @@ var createScene = async function () {
   scene.onBeforeRenderObservable.add(() => {
     const dt = scene.getEngine().getDeltaTime() / 1000;
 
-    // 悬停(未锁定):只在 spawnedMeshes 集合里做拾取,避免外界干扰
+    // 悬停(未锁定):只在 spawnedMeshes 集合里做拾取
     if (!lockedRoot && rightCtrl) {
       const ray = rayFromController(rightCtrl);
-
-      // 取所有命中中“属于生成网格集合”的最近一个
+      // 最近的“生成网格”命中
       const hits = scene.multiPickWithRay(ray, (m) => spawnedMeshes.has(m));
       const top = (hits && hits.length) ? hits[0] : null;
-
       const root = top ? findSpawnedRoot(top.pickedMesh) : null;
       setHoveredRoot(root);
     }
@@ -456,7 +486,7 @@ var createScene = async function () {
         const delta = moveDir.scale(curSpeed * dt);
         const newPos = lockedRoot.position.add(delta);
         const bottomOffset = lockedRoot.metadata.bottomOffset ?? 0;
-        newPos.y = ground.position.y + bottomOffset;
+        newPos.y = ground.position.y + bottomOffset;  // 贴地
         lockedRoot.position.copyFrom(newPos);
       }
     }
