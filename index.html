@@ -79,7 +79,7 @@ var createScene = async function () {
   const light = new BABYLON.HemisphericLight("light1", new BABYLON.Vector3(0,1,0), scene);
   light.intensity = 0.9;
 
-  // --- Ground:只显示网格线,底面完全透明 ---
+  // --- Ground:线可见、底几乎透明 ---
   const ground = BABYLON.MeshBuilder.CreateGround("myGround", { width: 30, height: 30 }, scene);
   ground.position.y = 0;
   ground.isPickable = true;
@@ -87,11 +87,11 @@ var createScene = async function () {
   const gridMat = new BABYLON.GridMaterial("gridMat", scene);
   gridMat.gridRatio = 1.0;
   gridMat.majorUnitFrequency = 4;
-  gridMat.minorUnitVisibility = 0.9;
-  gridMat.lineColor = new BABYLON.Color3(0.95, 1.0, 0.95);
+  gridMat.minorUnitVisibility = 3;               // 线“更粗/密”
+ gridMat.lineColor = new BABYLON.Color3(0.0, 0.95, 0.55); // 纯白更显眼
   gridMat.mainColor = new BABYLON.Color3(0, 0, 0);
-  gridMat.opacity = 0.0;                   // 背景完全透明
-  gridMat.alpha = 0.0;                     // 兼容某些平台
+  gridMat.opacity = 0.03;                           // ★ 留极小不透明以稳定显示线条(0 会整材质被跳过)
+  gridMat.alpha = gridMat.opacity;                  // 兼容不同平台
   gridMat.disableLighting = true;
   gridMat.transparencyMode = BABYLON.Material.MATERIAL_ALPHABLEND;
   gridMat.backFaceCulling = false;
@@ -165,14 +165,15 @@ var createScene = async function () {
   let lastSpawnAt = 0;
   const MIN_INTERVAL = 150;
 
-  // ====== 工具 ======
+  // ====== 工具:拾取/贴地/朝向 ======
   function rayFromController(ctrl, length = 100) {
     const origin = ctrl.pointer.position.clone();
     const fwd = BABYLON.Vector3.TransformNormal(BABYLON.Axis.Z, ctrl.pointer.getWorldMatrix()).normalize();
     return new BABYLON.Ray(origin, fwd, length);
   }
 
-  function computeHalfY(root) {
+  // 计算世界包围盒最小/最大 Y
+  function getWorldMinMaxY(root) {
     let minY = +Infinity, maxY = -Infinity;
     root.getChildMeshes().forEach((m) => {
       const bb = m.getBoundingInfo().boundingBox;
@@ -180,15 +181,25 @@ var createScene = async function () {
       if (vmin.y < minY) minY = vmin.y;
       if (vmax.y > maxY) maxY = vmax.y;
     });
-    return Math.max(0, maxY - minY) * 0.5;
+    return { minY, maxY };
   }
 
+  // 将 root 的“底面(minY)”对齐到 groundY,并记录 bottomOffset
+  function placeRootOnGround(root, groundY) {
+    const { minY } = getWorldMinMaxY(root);
+    const delta = groundY - minY;
+    root.position.y += delta;
+    root.metadata.bottomOffset = (root.position.y - minY);
+  }
+
+  // 高亮
   function setRootHighlight(root, on) {
     const meshes = root.getChildMeshes();
     if (on) meshes.forEach(m => hl.addMesh(m, HLCOLOR));
     else    meshes.forEach(m => hl.removeMesh(m));
   }
 
+  // 实例化 GLB
   function instantiateModel(name, scene) {
     const inst = glbContainer.instantiateModelsToScene((src) => `${name}_${src}`, false);
     const root = new BABYLON.TransformNode(`${name}_root`, scene);
@@ -203,12 +214,12 @@ var createScene = async function () {
     root.metadata = root.metadata || {};
     root.metadata.isSpawnedModel = true;
     root.metadata.inst = inst;
-    root.metadata.halfY = 0;
-    root.metadata.animPlaying = false; // ★ 动画播放开关(右摇杆短按切换)
+    root.metadata.bottomOffset = 0;     // 贴地偏移
+    root.metadata.animPlaying = false;  // 动画播放开关(右摇杆短按切换)
     return root;
   }
 
-  // —— 动画控制 —— //
+  // 动画控制
   function clipPick(groups, ks) {
     const kw = ks.map(k => k.toLowerCase());
     const out = groups.filter(g => kw.some(k => g.name.toLowerCase().includes(k)));
@@ -226,45 +237,40 @@ var createScene = async function () {
   function playMovingLoop(root) {
     const inst = root?.metadata?.inst; if (!inst) return;
     const groups = inst.animationGroups || []; if (!groups.length) return;
-
-    // 每次切换前先干净复位,避免叠加
     groups.forEach(ag => { ag.stop(); ag.reset(); ag.goToFrame(ag.from); });
-
     let playList = clipPick(groups, ["walk","move","run"]);
     if (!playList) playList = clipPick(groups, ["idle"]);
     if (!playList) playList = groups;
-
     playList.forEach(ag => ag.start(true, 1.0, ag.from, ag.to));
     root.metadata.animPlaying = true;
   }
 
-  // —— 让模型“正对用户” ——
+  // 让模型“正对用户”
   function faceUserYaw(root) {
     const cam = (xr && xr.baseExperience && xr.baseExperience.camera) || scene.activeCamera;
     if (!cam) return;
-    const dir = cam.globalPosition.subtract(root.position);
+    const dir = cam.globalPosition.subtract(root.position); // 模型→相机向量
     let yaw = Math.atan2(dir.x, dir.z);
-    if (MODEL_FORWARD_SIGN === +1) yaw += Math.PI;
+    if (MODEL_FORWARD_SIGN === +1) yaw += Math.PI; // 修正前向轴差异
     root.rotationQuaternion = null;
     root.rotation.y = yaw;
   }
 
+  // 生成实例
   function spawnModelAt(point) {
     const root = instantiateModel("spawnedModel", scene);
 
-    // 放置到点并面向用户
+    // 放置到点 & 面向用户
     root.position.copyFrom(point);
     faceUserYaw(root);
 
-    // 贴地
-    const halfY = computeHalfY(root);
-    root.metadata.halfY = halfY;
-    root.position.y = ground.position.y + halfY;
+    // 贴地(包围盒底对齐地面)
+    placeRootOnGround(root, ground.position.y);
 
-    // 生成时静态
+    // 初始静态
     stopToStatic(root);
 
-    // 弹入
+    // 弹入动画
     root.scaling.set(0.01,0.01,0.01);
     BABYLON.Animation.CreateAndStartAnimation(
       "popIn", root, "scaling", 60, 10,
@@ -288,16 +294,14 @@ var createScene = async function () {
     lockedRoot = hoveredRoot;
     hoveredRoot = null;
     setRootHighlight(lockedRoot, true);
-    // 锁定后保持当前动画状态(默认静态)
   }
   function unlockCurrent() {
     if (!lockedRoot) return;
-    // 解锁不强制停动画,如需停请改成 stopToStatic(lockedRoot);
     setRootHighlight(lockedRoot, false);
     lockedRoot = null;
   }
 
-  // —— 只取控制器 yaw 的水平基向量 —— //
+  // 控制器 yaw 的水平基向量
   const tmpR = new BABYLON.Vector3(), tmpF = new BABYLON.Vector3();
   function horizontalBasis(ctrl) {
     const m = ctrl.pointer.getWorldMatrix();
@@ -348,11 +352,9 @@ var createScene = async function () {
           stick.onButtonStateChangedObservable.add(() => {
             const pressed = !!stick.pressed;
             if (pressed && !stickPressed) {
-              // 按下时记录时间
               stickPressed = true;
               stickPressDownAt = performance.now();
             } else if (!pressed && stickPressed) {
-              // 松开:判断长短按
               stickPressed = false;
               const dur = performance.now() - stickPressDownAt;
               const isLong = dur >= LONG_PRESS_MS;
@@ -361,17 +363,12 @@ var createScene = async function () {
                 // 长按:解锁
                 if (lockedRoot) unlockCurrent();
               } else {
-                // 短按:
+                // 短按:未锁定则锁定;已锁定则切动画开/关
                 if (!lockedRoot) {
-                  // 未锁定 -> 锁定当前悬停
                   if (hoveredRoot) lockCurrentHovered();
                 } else {
-                  // 已锁定 -> 切换动画开/关
-                  if (lockedRoot.metadata.animPlaying) {
-                    stopToStatic(lockedRoot);
-                  } else {
-                    playMovingLoop(lockedRoot);
-                  }
+                  if (lockedRoot.metadata.animPlaying) stopToStatic(lockedRoot);
+                  else playMovingLoop(lockedRoot);
                 }
               }
             }
@@ -400,7 +397,7 @@ var createScene = async function () {
       setHoveredRoot(root);
     }
 
-    // 锁定时:右摇杆控制“任意角度”在水平面移动(动画状态不受输入影响)
+    // 锁定时:右摇杆控制移动(动画状态不受输入影响)
     if (lockedRoot && rightCtrl) {
       const mag = Math.hypot(stickX, stickY);
       if (!inputActive) { if (mag > DEADZONE_IN) inputActive = true; }
@@ -430,8 +427,9 @@ var createScene = async function () {
       if (curSpeed > 1e-4 && moveDir.lengthSquared() > 1e-6) {
         const delta = moveDir.scale(curSpeed * dt);
         const newPos = lockedRoot.position.add(delta);
-        const halfY = lockedRoot.metadata.halfY || computeHalfY(lockedRoot);
-        newPos.y = ground.position.y + halfY;
+        const bottomOffset = lockedRoot.metadata.bottomOffset ?? 0;
+        // 贴地:保持底部与地面对齐
+        newPos.y = ground.position.y + bottomOffset;
         lockedRoot.position.copyFrom(newPos);
       }
     }
