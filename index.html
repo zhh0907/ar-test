@@ -83,6 +83,17 @@
     optionalFeatures: true
   });
 
+  // 关闭会“带走镜头/视角”的内置特性(只保留我们自己的摇杆逻辑)
+  const fm = xr.baseExperience.featuresManager;
+  try {
+    fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION);
+  } catch {}
+  try {
+    fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT);
+  } catch {}
+  // 如若仍有冲突,可再尝试禁用指针选择:
+  // try { fm.disableFeature(BABYLON.WebXRFeatureName.POINTER_SELECTION); } catch {}
+
   // ---------- 共享状态 ----------
   const cubes = [];            // 已生成的方块
   let selectedMesh = null;     // 当前被指向选中的方块
@@ -96,13 +107,12 @@
   cubeTemplate.isPickable = true;
   cubeTemplate.rotationQuaternion = new BABYLON.Quaternion(); // 关键行
 
-  // 命中标记(已有 quaternion)
-  const marker = BABYLON.MeshBuilder.CreateTorus("marker", { diameter: 0.15, thickness: 0.05 }, scene);
+  // 命中标记:缩小(直径 6cm、厚度 1cm)
+  const marker = BABYLON.MeshBuilder.CreateTorus("marker", { diameter: 0.06, thickness: 0.01 }, scene);
   marker.isVisible = false;
   marker.rotationQuaternion = new BABYLON.Quaternion();
 
   // ---------- 工具函数 ----------
-  // 将 WebXR XRPose 写入 Babylon 节点(带 quaternion 兜底)
   function applyPoseToNode(pose, node) {
     const { position, orientation } = pose.transform;
     node.position.set(position.x, position.y, position.z);
@@ -125,7 +135,7 @@
       const trigger = motionController.getComponent("xr-standard-trigger");
       const thumbstick = motionController.getComponent("xr-standard-thumbstick");
 
-      // 摇杆:只取 X;松开时归零
+      // 摇杆:只取 X;松开时归零 —— 仅用于“旋转物体”
       if (thumbstick) {
         thumbstick.onAxisValueChangedObservable.add((axes) => {
           rightThumbstickX = axes.x || 0;
@@ -142,7 +152,6 @@
             const newCube = cubeTemplate.clone("cube_" + cubes.length);
             newCube.isVisible = true;
             newCube.isPickable = true;
-            // 兜底:克隆体若缺 quaternion 则补上(双保险)
             if (!newCube.rotationQuaternion) newCube.rotationQuaternion = new BABYLON.Quaternion();
             applyPoseToNode(latestHitPose, newCube);
             cubes.push(newCube);
@@ -158,7 +167,7 @@
       });
 
       xr.baseExperience.sessionManager.onXRFrameObservable.add((xrFrame) => {
-        // 1) Hit test:记录 latestHitPose,移动 marker
+        // 1) Hit test:记录 latestHitPose,移动 marker(小甜甜圈)
         const results = xrFrame.getHitTestResults(hitTestSource);
         if (results.length) {
           const pose = results[0].getPose(refSpace);
@@ -190,17 +199,14 @@
           selectedMesh = null;
         }
 
-        // 3) 有选中 + 摇杆X 有效 -> 左右移动(世界 X 轴)
+        // 3) 仅“旋转”已选中物体(不平移、不改变视角)
         if (selectedMesh && Math.abs(rightThumbstickX) > 0.02) {
           const dt = scene.getEngine().getDeltaTime() / 1000;
-          const speed = 0.4; // m/s
-          const delta = new BABYLON.Vector3(rightThumbstickX * speed * dt, 0, 0);
-          selectedMesh.position.addInPlace(delta);
+          const yawSpeed = 2.5; // 每秒最大约 2.5 弧度(≈143°/s),可按需调整
+          const deltaYaw = rightThumbstickX * yawSpeed * dt;
 
-          // 如需“按相机左右”移动,改用下列三行替换上面两行:
-          // const viewDir = camera.getDirection(BABYLON.Axis.Z).normalize();
-          // const right = BABYLON.Vector3.Cross(new BABYLON.Vector3(0,1,0), viewDir).normalize();
-          // selectedMesh.position.addInPlace(right.scale(rightThumbstickX * speed * dt));
+          // 绕世界Y轴旋转(方向控制更直观);如需局部Y轴改为 BABYLON.Space.LOCAL
+          selectedMesh.rotate(BABYLON.Axis.Y, deltaYaw, BABYLON.Space.WORLD);
         }
       });
       // ----------(你的 hit test 部分到此结束)----------
