@@ -63,15 +63,14 @@
         var scene = null;
         var sceneToRender = null;
         var createDefaultEngine = function() { return new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true,  disableWebGL2Support: false}); };
-        // ===== 常量:使用 URL =====
+        // ===== URL =====
 const MODEL_URL = "./lp_robot.glb";
-const MODEL_FORWARD_SIGN = -1; // -Z forward
-const MODEL_SCALE = 1 / 4;     // 统一缩放到 1/4
+const MODEL_FORWARD_SIGN = -1; 
+const MODEL_SCALE = 1 / 4;     
 
 var createScene = async function () {
   const scene = new BABYLON.Scene(engine);
 
-  // --- Camera & Light ---
   const camera = new BABYLON.FreeCamera("camera1", new BABYLON.Vector3(0, 1, -5), scene);
   camera.setTarget(BABYLON.Vector3.Zero());
   camera.attachControl(canvas, true);
@@ -81,7 +80,7 @@ var createScene = async function () {
 
   scene.useRightHandedSystem = true;
 
-  // --- XR (AR) ---
+  // ===== AR ===== 
   const xr = await scene.createDefaultXRExperienceAsync({
     uiOptions: { sessionMode: "immersive-ar" },
     optionalFeatures: true
@@ -89,22 +88,19 @@ var createScene = async function () {
   const fm = xr.baseExperience.featuresManager;
   try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION); } catch {}
   try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); } catch {}
-  // 如仍冲突可再禁用指针选择:
-  // try { fm.disableFeature(BABYLON.WebXRFeatureName.POINTER_SELECTION); } catch {}
 
-  // ---------- 状态 ----------
-  let activeContainer = null;      // “活动”实例:总是控制最近一次生成的
+  let activeContainer = null;     
   let latestHitPose = null;
-  let rightAxisX = 0;              // 右摇杆 X:左(-) / 右(+)
-  let rightAxisY = 0;              // 右摇杆 Y:后(-) / 前(+)(按你的要求“往前推=前”)
+  let rightAxisX = 0;              
+  let rightAxisY = 0;            
   const models = [];
 
-  // ---------- 命中标记(小甜甜圈) ----------
+  // ===== Mark ===== 
   const marker = BABYLON.MeshBuilder.CreateTorus("marker", { diameter: 0.06, thickness: 0.01 }, scene);
   marker.isVisible = false;
   marker.rotationQuaternion = new BABYLON.Quaternion();
 
-  // ---------- 工具 ----------
+  // ===== Tools ===== 
   function applyPoseToNode(pose, node) {
     const { position, orientation } = pose.transform;
     node.position.set(position.x, position.y, position.z);
@@ -120,7 +116,6 @@ var createScene = async function () {
     return { fwdPlanar, right };
   }
 
-  // ====== 资产容器作为模板(不入场景) ======
   let prefabContainer = null;
   let prefabReady = false;
   try {
@@ -135,17 +130,14 @@ var createScene = async function () {
     });
     prefabReady = true;
   } catch (e) {
-    // 静默失败;prefabReady=false 时不会尝试生成
   }
 
-  // 生成实例:返回 TransformNode 容器
   function spawnModelAtPose(pose) {
     if (!prefabReady || !prefabContainer) return null;
 
     const container = new BABYLON.TransformNode("model_" + models.length, scene);
     container.__spawnContainer = true;
     container.rotationQuaternion = new BABYLON.Quaternion();
-    // 平滑移动状态
     container.metadata = {
       velPlanar: new BABYLON.Vector3(0,0,0),
       velTarget: new BABYLON.Vector3(0,0,0)
@@ -178,7 +170,6 @@ var createScene = async function () {
       container.rotationQuaternion = rot180Y.multiply(container.rotationQuaternion);
     }
 
-    // 弹出动画到 1/4
     const startPos = container.position.clone();
     container.scaling.set(0.001, 0.001, 0.001);
     container.setEnabled(true);
@@ -207,7 +198,7 @@ var createScene = async function () {
     return container;
   }
 
-  // ---------- 控制器 ----------
+  //  ===== Controller =====
   xr.input.onControllerAddedObservable.add(async (controller) => {
     controller.onMotionControllerInitObservable.add(async (motionController) => {
       if (motionController.handedness !== "right") return;
@@ -215,83 +206,75 @@ var createScene = async function () {
       const trigger = motionController.getComponent("xr-standard-trigger");
       const thumbstick = motionController.getComponent("xr-standard-thumbstick");
 
-      // 摇杆:上=前(+Y),下=后(-Y),左=左(-X),右=右(+X)
       if (thumbstick) {
         thumbstick.onAxisValueChangedObservable.add((axes) => {
           rightAxisX = axes.x || 0;
-          rightAxisY = axes.y || 0; // 注意:此处保持“上推=+Y”,后面直接用 +Y 表示前进
+          rightAxisY = axes.y || 0;
         });
         thumbstick.onButtonStateChangedObservable.add((state) => {
           if (!state.pressed) { rightAxisX = 0; rightAxisY = 0; }
         });
       }
 
-      // 扳机:在命中点生成,并把该实例设为“活动对象”,之后无需指着它也能移动
+      // Trigger
       if (trigger) {
         trigger.onButtonStateChangedObservable.add((state) => {
           if (state.changes.pressed && state.pressed && latestHitPose) {
             const inst = spawnModelAtPose(latestHitPose);
-            if (inst) activeContainer = inst; // 锁定为活动对象
+            if (inst) activeContainer = inst; 
           }
         });
       }
 
-      // ===== 原生 hit-test(保持不变) =====
+      // ===== hit-test =====
       const session = xr.baseExperience.sessionManager.session;
       const refSpace = xr.baseExperience.sessionManager.referenceSpace;
       const hitTestSource = await session.requestHitTestSource({ space: controller.inputSource.targetRaySpace });
 
-      // —— 临时向量(减少 GC) —— //
       const tmpDesired = new BABYLON.Vector3();
       const tmpRight = new BABYLON.Vector3();
       const tmpFwd = new BABYLON.Vector3();
 
       xr.baseExperience.sessionManager.onXRFrameObservable.add((xrFrame) => {
-        // 1) hit test:只负责 marker 与 latestHitPose
         const results = xrFrame.getHitTestResults(hitTestSource);
         if (results.length) {
           const pose = results[0].getPose(refSpace);
           if (pose) { latestHitPose = pose; marker.isVisible = true; applyPoseToNode(pose, marker); }
         } else { marker.isVisible = false; }
 
-        // 2) 移动“活动对象”(无需指向)
         if (activeContainer) {
-          // 固定 dt 上限,避免掉帧大跳
           let dt = scene.getEngine().getDeltaTime() / 1000;
           if (dt > 1/15) dt = 1/15;
 
-          // 手感参数(可根据需要微调)
-          const DEADZONE = 0.12;     // 摇杆死区
-          const SPEED_MAX = 1.3;     // m/s 最高速度
-          const ACC_MAX = 5.0;       // m/s^2 最高加速度
-          const FRICTION = 5.0;      // 阻尼(越大收得越快)
-          const RESP_K = 12.0;       // 目标速度指数平滑系数
 
-          // 相机基的水平向量
+          const DEADZONE = 0.12;  
+          const SPEED_MAX = 1.3;     
+          const ACC_MAX = 5.0;    
+          const FRICTION = 5.0;     
+          const RESP_K = 12.0;      
+
+        
           const basis = getPlanarBasisFromCamera();
           tmpRight.copyFrom(basis.right);
           tmpFwd.copyFrom(basis.fwdPlanar);
 
-          // 输入处理:死区 + 立方曲线(更细腻)
+         
           let ix = Math.abs(rightAxisX) < DEADZONE ? 0 : rightAxisX;
           let iy = Math.abs(rightAxisY) < DEADZONE ? 0 : rightAxisY;
           ix = -Math.sign(ix) * Math.pow(Math.abs(ix), 3);
           iy = -Math.sign(iy) * Math.pow(Math.abs(iy), 3);
 
-          // 目标速度:X 控制左右(right 向),Y 控制前后(fwd 向)
           tmpDesired.copyFrom(tmpRight).scaleInPlace(ix * SPEED_MAX)
-                   .addInPlace(tmpFwd.scale(iy * SPEED_MAX)); // 注意这里直接用 +iy:上推=前
+                   .addInPlace(tmpFwd.scale(iy * SPEED_MAX));
 
           const md = activeContainer.metadata;
           const velTarget = md.velTarget, vel = md.velPlanar;
 
-          // 指数平滑到 velTarget(帧率无关)
           const alpha = 1 - Math.exp(-RESP_K * dt);
           velTarget.x += (tmpDesired.x - velTarget.x) * alpha;
           velTarget.y = 0;
           velTarget.z += (tmpDesired.z - velTarget.z) * alpha;
 
-          // 朝目标速度加速,受加速度上限约束
           const ax = (velTarget.x - vel.x) / dt;
           const az = (velTarget.z - vel.z) / dt;
           const aMag = Math.hypot(ax, az);
@@ -300,11 +283,9 @@ var createScene = async function () {
           vel.x += ax * aScale * dt;
           vel.z += az * aScale * dt;
 
-          // 阻尼
           const damp = Math.exp(-FRICTION * dt);
           vel.x *= damp; vel.z *= damp; vel.y = 0;
 
-          // 应用位移
           activeContainer.position.addInPlace(vel.scale(dt));
         }
       });
