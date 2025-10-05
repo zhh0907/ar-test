@@ -275,8 +275,8 @@ var createScene = async function () {
           // 输入处理:死区 + 立方曲线(更细腻)
           let ix = Math.abs(rightAxisX) < DEADZONE ? 0 : rightAxisX;
           let iy = Math.abs(rightAxisY) < DEADZONE ? 0 : rightAxisY;
-          ix = Math.sign(ix) * Math.pow(Math.abs(ix), 3);
-          iy = Math.sign(iy) * Math.pow(Math.abs(iy), 3);
+          ix = -Math.sign(ix) * Math.pow(Math.abs(ix), 3);
+          iy = -Math.sign(iy) * Math.pow(Math.abs(iy), 3);
 
           // 目标速度:X 控制左右(right 向),Y 控制前后(fwd 向)
           tmpDesired.copyFrom(tmpRight).scaleInPlace(ix * SPEED_MAX)
