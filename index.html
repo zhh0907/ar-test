@@ -74,42 +74,50 @@
   const light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
   light.intensity = 0.7;
 
+  // WebXR 常用右手系
   scene.useRightHandedSystem = true;
 
-  // WebXR AR session
+  // WebXR AR 会话
   const xr = await scene.createDefaultXRExperienceAsync({
     uiOptions: { sessionMode: "immersive-ar" },
     optionalFeatures: true
   });
 
-  // Shared state
-  const cubes = [];
-  let selectedMesh = null;
-  let latestHitPose = null;
-  let rightThumbstickX = 0;
+  // ---------- 共享状态 ----------
+  const cubes = [];            // 已生成的方块
+  let selectedMesh = null;     // 当前被指向选中的方块
+  let latestHitPose = null;    // 最近的 hit test 位姿
+  let rightThumbstickX = 0;    // 右手摇杆X
 
-  // Template cube and marker
+  // ---------- 可视对象 ----------
+  // 模板立方体(启用 rotationQuaternion,避免克隆后设置姿态时崩溃)
   const cubeTemplate = BABYLON.MeshBuilder.CreateBox("cubeTemplate", { size: 0.1 }, scene);
   cubeTemplate.isVisible = false;
   cubeTemplate.isPickable = true;
+  cubeTemplate.rotationQuaternion = new BABYLON.Quaternion(); // 关键行
 
+  // 命中标记(已有 quaternion)
   const marker = BABYLON.MeshBuilder.CreateTorus("marker", { diameter: 0.15, thickness: 0.05 }, scene);
   marker.isVisible = false;
   marker.rotationQuaternion = new BABYLON.Quaternion();
 
+  // ---------- 工具函数 ----------
+  // 将 WebXR XRPose 写入 Babylon 节点(带 quaternion 兜底)
   function applyPoseToNode(pose, node) {
     const { position, orientation } = pose.transform;
     node.position.set(position.x, position.y, position.z);
+    if (!node.rotationQuaternion) node.rotationQuaternion = new BABYLON.Quaternion();
     node.rotationQuaternion.set(orientation.x, orientation.y, orientation.z, orientation.w);
   }
 
+  // 用四元数旋转一个向量(用于把 -Z 前向旋到世界方向)
   function v3RotateByQuat(v, q) {
-    // v' = v + 2*cross(q.xyz, cross(q.xyz, v) + q.w*v)
     const qv = new BABYLON.Vector3(q.x, q.y, q.z);
     const t = BABYLON.Vector3.Cross(qv, v).scale(2.0);
     return v.add(t.scale(q.w)).add(BABYLON.Vector3.Cross(qv, t));
   }
 
+  // ---------- 控制器 ----------
   xr.input.onControllerAddedObservable.add(async (controller) => {
     controller.onMotionControllerInitObservable.add(async (motionController) => {
       if (motionController.handedness !== "right") return;
@@ -117,6 +125,7 @@
       const trigger = motionController.getComponent("xr-standard-trigger");
       const thumbstick = motionController.getComponent("xr-standard-thumbstick");
 
+      // 摇杆:只取 X;松开时归零
       if (thumbstick) {
         thumbstick.onAxisValueChangedObservable.add((axes) => {
           rightThumbstickX = axes.x || 0;
@@ -126,19 +135,22 @@
         });
       }
 
+      // 扳机:按下瞬间在 latestHitPose 处生成方块
       if (trigger) {
         trigger.onButtonStateChangedObservable.add((state) => {
           if (state.changes.pressed && state.pressed && latestHitPose) {
-            const newCube = cubeTemplate.clone("cube");
+            const newCube = cubeTemplate.clone("cube_" + cubes.length);
             newCube.isVisible = true;
             newCube.isPickable = true;
+            // 兜底:克隆体若缺 quaternion 则补上(双保险)
+            if (!newCube.rotationQuaternion) newCube.rotationQuaternion = new BABYLON.Quaternion();
             applyPoseToNode(latestHitPose, newCube);
             cubes.push(newCube);
           }
         });
       }
 
-      // Hit test based on right target ray
+      // ----------(保留你的 hit test 实现,不更改)----------
       const session = xr.baseExperience.sessionManager.session;
       const refSpace = xr.baseExperience.sessionManager.referenceSpace;
       const hitTestSource = await session.requestHitTestSource({
@@ -146,7 +158,7 @@
       });
 
       xr.baseExperience.sessionManager.onXRFrameObservable.add((xrFrame) => {
-        // 1) Hit test
+        // 1) Hit test:记录 latestHitPose,移动 marker
         const results = xrFrame.getHitTestResults(hitTestSource);
         if (results.length) {
           const pose = results[0].getPose(refSpace);
@@ -159,32 +171,39 @@
           marker.isVisible = false;
         }
 
-        // 2) Build picking ray from right target ray
+        // 2) 从右手 target ray 构造射线 -> 选择方块
         const tgtPose = xrFrame.getPose(controller.inputSource.targetRaySpace, refSpace);
         if (tgtPose) {
           const o = tgtPose.transform.position;
           const origin = new BABYLON.Vector3(o.x, o.y, o.z);
+
           const q = tgtPose.transform.orientation;
           const rot = new BABYLON.Quaternion(q.x, q.y, q.z, q.w);
+
           const forward = new BABYLON.Vector3(0, 0, -1);
           const dir = v3RotateByQuat(forward, rot).normalize();
-          const ray = new BABYLON.Ray(origin, dir, 10.0);
 
+          const ray = new BABYLON.Ray(origin, dir, 10.0);
           const pick = scene.pickWithRay(ray, (m) => m && m.isPickable && cubes.indexOf(m) !== -1);
           selectedMesh = (pick && pick.hit) ? pick.pickedMesh : null;
         } else {
           selectedMesh = null;
         }
 
-        // 3) Move selected with thumbstick X
+        // 3) 有选中 + 摇杆X 有效 -> 左右移动(世界 X 轴)
         if (selectedMesh && Math.abs(rightThumbstickX) > 0.02) {
           const dt = scene.getEngine().getDeltaTime() / 1000;
-          const speed = 0.4;
+          const speed = 0.4; // m/s
           const delta = new BABYLON.Vector3(rightThumbstickX * speed * dt, 0, 0);
           selectedMesh.position.addInPlace(delta);
 
+          // 如需“按相机左右”移动,改用下列三行替换上面两行:
+          // const viewDir = camera.getDirection(BABYLON.Axis.Z).normalize();
+          // const right = BABYLON.Vector3.Cross(new BABYLON.Vector3(0,1,0), viewDir).normalize();
+          // selectedMesh.position.addInPlace(right.scale(rightThumbstickX * speed * dt));
         }
       });
+      // ----------(你的 hit test 部分到此结束)----------
     });
   });
 
