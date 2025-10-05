@@ -65,8 +65,9 @@
         var createDefaultEngine = function() { return new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true,  disableWebGL2Support: false}); };
         // ===== 常量(按你的要求保留) =====
 const MODEL_URL = "./lp_robot.glb";
-const MODEL_FORWARD_SIGN = -1; // -1: 模型前向为 -Z;+1: 模型前向为 +Z,需要额外旋转180度
+const MODEL_FORWARD_SIGN = -1; // -1: 模型前向就是 -Z;+1: 表示原始为 +Z,需要额外旋转 180°
 const MODEL_SCALE = 1 / 3;     // 统一缩放到 1/3
+const DIAG_SPAWN_CUBE = true;  // 诊断:同时生成一个红色 cube 做对照(3s 自动消失)
 
 var createScene = async function () {
   const scene = new BABYLON.Scene(engine);
@@ -95,12 +96,17 @@ var createScene = async function () {
   // 如仍冲突可再禁用指针选择:
   // try { fm.disableFeature(BABYLON.WebXRFeatureName.POINTER_SELECTION); } catch {}
 
-  // ---------- 状态 ----------
-  const models = [];          // TransformNode 容器列表
+  // ---------- 运行状态 ----------
+  const models = [];          // TransformNode 容器列表(每个实例一个容器)
   let selectedContainer = null;
   let latestHitPose = null;
   let rightAxisX = 0;         // 右摇杆X:旋转朝向
   let rightAxisY = 0;         // 右摇杆Y:前后平移
+  let prefabRoot = null;
+  let prefabReady = false;
+
+  // 共享高亮层(做 3 秒高亮提示)
+  let hlLayer = null;
 
   // ---------- 命中标记(小甜甜圈) ----------
   const marker = BABYLON.MeshBuilder.CreateTorus("marker", { diameter: 0.06, thickness: 0.01 }, scene);
@@ -139,15 +145,12 @@ var createScene = async function () {
   }
 
   // ---------- 预加载 GLB 为“预制体”(不禁用,只隐藏) ----------
-  let prefabRoot = null;
-  let prefabReady = false;
   try {
     const result = await BABYLON.SceneLoader.ImportMeshAsync("", "", MODEL_URL, scene);
 
     prefabRoot = new BABYLON.TransformNode("prefabRoot", scene);
     prefabRoot.rotationQuaternion = BABYLON.Quaternion.Identity();
     // 注意:不要 setEnabled(false),用 isVisible 隐藏模板本体
-    // prefabRoot.setEnabled(false); // ❌ 不要禁用
 
     // 把导入出的顶层节点挂到 prefabRoot,模板网格隐藏且不可拾取
     const topLevel = new Set(result.meshes.filter(m => !m.parent));
@@ -169,7 +172,6 @@ var createScene = async function () {
     }
 
     prefabReady = true;
-    console.log("[Prefab ready]");
   } catch (e) {
     console.error("[GLB Load Error]", e);
   }
@@ -177,7 +179,7 @@ var createScene = async function () {
   // ---------- 生成实例(可见&启用 + 弹出动画 + 1/3 缩放) ----------
   function spawnModelAtPose(pose) {
     if (!prefabReady || !prefabRoot) {
-      console.warn("Prefab not ready yet; skip spawn.");
+      warnText("Prefab not ready");
       return null;
     }
 
@@ -241,11 +243,24 @@ var createScene = async function () {
     container.animations = [scaleAnim, posAnim];
     scene.beginAnimation(container, 0, 12, false);
 
+    // —— 诊断:强制启用 + 高亮 3s,确认实例确实出现 —— //
+    try {
+      if (!hlLayer) hlLayer = new BABYLON.HighlightLayer("hl", scene);
+      const anyMesh = container.getChildMeshes()[0];
+      if (anyMesh) {
+        hlLayer.addMesh(anyMesh, BABYLON.Color3.Yellow());
+        setTimeout(()=>{ try{ hlLayer.removeMesh(anyMesh); }catch{} }, 3000);
+      }
+    } catch {}
+
     models.push(container);
     return container;
   }
 
   // ---------- 控制器 ----------
+  // 诊断 UI 计数
+  let __spawnCount = 0;
+
   xr.input.onControllerAddedObservable.add(async (controller) => {
     controller.onMotionControllerInitObservable.add(async (motionController) => {
       if (motionController.handedness !== "right") return;
@@ -268,15 +283,29 @@ var createScene = async function () {
       if (trigger) {
         trigger.onButtonStateChangedObservable.add((state) => {
           if (state.changes.pressed && state.pressed && latestHitPose) {
+            let ok = false;
             try {
               const inst = spawnModelAtPose(latestHitPose);
               if (inst && inst.rotationQuaternion) {
                 const eul = inst.rotationQuaternion.toEulerAngles();
                 inst.metadata.targetYaw = eul.y; // 初始化目标朝向
+                ok = true;
               }
-              // console.log("spawn at", latestHitPose.transform.position);
             } catch (e) {
-              console.error("[Spawn Error]", e);
+              ok = false;
+            }
+
+            __spawnCount++;
+            flash(ok);
+
+            if (DIAG_SPAWN_CUBE) {
+              const c = BABYLON.MeshBuilder.CreateBox("diagCube", {size:0.1}, scene);
+              applyPoseToNode(latestHitPose, c);
+              const mat = new BABYLON.StandardMaterial("m", scene);
+              mat.diffuseColor = new BABYLON.Color3(ok ? 0 : 1, ok ? 1 : 0, 0);
+              mat.alpha = 0.8;
+              c.material = mat;
+              setTimeout(()=>c.dispose(), 3000);
             }
           }
         });
@@ -362,6 +391,111 @@ var createScene = async function () {
       // ----------(hit test 结束)----------
     });
   });
+
+  // ---------- 诊断 UI:不依赖控制台 ----------
+  let diag = {
+    useGUI: !!BABYLON.GUI,
+    uiTex: null,
+    panel: null,
+    labels: [],
+    counter: 0,
+    plane: null,
+    dyntex: null
+  };
+
+  function setupDiagUI() {
+    if (diag.useGUI) {
+      diag.uiTex = BABYLON.GUI.AdvancedDynamicTexture.CreateFullscreenUI("diagUI", true, scene);
+      diag.panel = new BABYLON.GUI.StackPanel();
+      diag.panel.width = "360px";
+      diag.panel.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+      diag.panel.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+      diag.panel.paddingTop = "8px";
+      diag.panel.paddingLeft = "8px";
+      diag.uiTex.addControl(diag.panel);
+
+      function mkLabel() {
+        const t = new BABYLON.GUI.TextBlock();
+        t.color = "white";
+        t.fontSize = 18;
+        t.textHorizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+        t.height = "24px";
+        t.text = "";
+        return t;
+      }
+      for (let i=0;i<5;i++){ const L = mkLabel(); diag.labels.push(L); diag.panel.addControl(L); }
+    } else {
+      // Fallback:相机前方的小牌子 + DynamicTexture 文本
+      diag.plane = BABYLON.MeshBuilder.CreatePlane("diagPlane",{size:0.35},scene);
+      diag.plane.position = camera.position.add(new BABYLON.Vector3(0.2,0.2,0.6));
+      diag.plane.billboardMode = BABYLON.Mesh.BILLBOARDMODE_ALL;
+      const mat = new BABYLON.StandardMaterial("diagMat", scene);
+      diag.dyntex = new BABYLON.DynamicTexture("diagDT", {width:512, height:256}, scene, true);
+      mat.diffuseTexture = diag.dyntex;
+      mat.emissiveColor = new BABYLON.Color3(1,1,1);
+      mat.backFaceCulling = false;
+      diag.plane.material = mat;
+    }
+  }
+  setupDiagUI();
+
+  function setOK_GUI(label, key, ok){
+    label.text = `${key}: ${typeof ok === "boolean" ? (ok ? "OK" : "...") : ok}`;
+    label.color = (ok === true) ? "#7CFC00" : (ok === false ? "#FF6347" : "white");
+  }
+  function setOK_Fallback(texts){
+    const ctx = diag.dyntex.getContext();
+    ctx.fillStyle = "rgba(0,0,0,0.5)";
+    ctx.fillRect(0,0,512,256);
+    ctx.fillStyle = "white";
+    ctx.font = "24px monospace";
+    texts.forEach((t,i)=>{ ctx.fillText(t, 16, 40 + i*40); });
+    diag.dyntex.update();
+  }
+
+  function refreshDiagUI(){
+    const lines = [
+      `GLB Loaded: ${prefabReady ? "OK" : "..."}`,
+      `Hit Pose  : ${!!latestHitPose}`,
+      `Models    : ${models.length}`,
+      `Selected  : ${!!selectedContainer}`,
+      `Spawned   : ${__spawnCount}`
+    ];
+    if (diag.useGUI) {
+      setOK_GUI(diag.labels[0], "GLB Loaded", !!prefabReady);
+      setOK_GUI(diag.labels[1], "Hit Pose", !!latestHitPose);
+      setOK_GUI(diag.labels[2], "Models", models.length);
+      setOK_GUI(diag.labels[3], "Selected", !!selectedContainer);
+      setOK_GUI(diag.labels[4], "Spawned", __spawnCount);
+    } else {
+      setOK_Fallback(lines);
+    }
+  }
+
+  // 屏幕闪烁提示(绿=成功,红=失败)
+  function flash(ok) {
+    if (diag.useGUI && diag.uiTex) {
+      const rect = new BABYLON.GUI.Rectangle(); rect.thickness = 0; rect.width = "100%"; rect.height = "100%"; rect.background = ok ? "#00800066" : "#FF000066";
+      diag.uiTex.addControl(rect);
+      setTimeout(()=>diag.uiTex.removeControl(rect), 120);
+    } else {
+      // Fallback:略过闪烁,仅依靠红色/绿色 cube 可视对照
+    }
+  }
+  // 当 prefab 未就绪等需要提示时
+  function warnText(msg){
+    if (diag.useGUI && diag.uiTex) {
+      const t = new BABYLON.GUI.TextBlock();
+      t.text = msg; t.color = "yellow"; t.fontSize = 18;
+      t.top = "160px"; t.left = "8px";
+      t.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+      t.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+      diag.uiTex.addControl(t);
+      setTimeout(()=>diag.uiTex.removeControl(t), 1500);
+    }
+  }
+
+  scene.onBeforeRenderObservable.add(refreshDiagUI);
 
   return scene;
 };
