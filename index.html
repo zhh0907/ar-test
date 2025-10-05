@@ -63,12 +63,10 @@
         var scene = null;
         var sceneToRender = null;
         var createDefaultEngine = function() { return new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true,  disableWebGL2Support: false}); };
-        // ===== 常量:使用“绝对 URL” =====
-// 👉 请把下面 URL 换成你自己的在线地址(https/可直连的 .glb)
+        // ===== 常量:使用 URL =====
 const MODEL_URL = "./lp_robot.glb";
 const MODEL_FORWARD_SIGN = -1; // -1: 模型前向就是 -Z;+1: 原始为 +Z,需要额外旋转180°
-const MODEL_SCALE = 1;     // 统一缩放到 1/3
-const DIAG_SPAWN_CUBE = true;  // 诊断:同时生成绿色 cube 作为对照(3s 自动消失)
+const MODEL_SCALE = 1 / 4;     // 统一缩放到 1/4
 
 var createScene = async function () {
   const scene = new BABYLON.Scene(engine);
@@ -90,7 +88,7 @@ var createScene = async function () {
     optionalFeatures: true
   });
 
-  // 禁用会劫持摇杆移动视角的特性
+  // 禁用可能劫持摇杆的内置特性
   const fm = xr.baseExperience.featuresManager;
   try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION); } catch {}
   try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); } catch {}
@@ -101,9 +99,8 @@ var createScene = async function () {
   const models = [];          // TransformNode 容器列表(每个实例一个容器)
   let selectedContainer = null;
   let latestHitPose = null;
-  let rightAxisX = 0;         // 右摇杆X:旋转朝向
-  let rightAxisY = 0;         // 右摇杆Y:前后平移
-  let __spawnCount = 0;
+  let rightAxisX = 0;         // 右摇杆X:水平面内“右移/左移”
+  let rightAxisY = 0;         // 右摇杆Y:水平面内“前进/后退”
 
   // ---------- 命中标记(小甜甜圈) ----------
   const marker = BABYLON.MeshBuilder.CreateTorus("marker", { diameter: 0.06, thickness: 0.01 }, scene);
@@ -127,6 +124,7 @@ var createScene = async function () {
     while (n) { if (n.__spawnContainer) return n; n = n.parent; }
     return null;
   }
+  // 基于“相机”的水平前向/右向(锁定在世界水平面)
   function getPlanarBasis() {
     const up = new BABYLON.Vector3(0, 1, 0);
     const camFwd = camera.getDirection(BABYLON.Axis.Z).normalize();
@@ -135,32 +133,24 @@ var createScene = async function () {
     if (!isFinite(right.length()) || right.length() < 1e-3) right = new BABYLON.Vector3(1, 0, 0);
     return { fwdPlanar, right };
   }
-  function normalizeAngle(a) {
-    while (a > Math.PI) a -= Math.PI * 2;
-    while (a < -Math.PI) a += Math.PI * 2;
-    return a;
-  }
 
-  // ====== 关键:用 AssetContainer 做“模板”,不加入场景,按需实例化 ======
+  // ====== 资产容器做“模板”,不加入场景,按需实例化 ======
   let prefabContainer = null;
   let prefabReady = false;
   try {
-    // 直接把 GLB 装进 AssetContainer(不 addAllToScene)
     prefabContainer = await BABYLON.SceneLoader.LoadAssetContainerAsync("", MODEL_URL, scene);
-
-    // 只把“容器内的原件”标成模板态(不可见/不拾取),不改 parent,不禁用
-    prefabContainer.meshes.forEach(m => { 
+    // 模板:只在容器内将原件设为不可见/不拾取,不改层级、不禁用
+    prefabContainer.meshes.forEach(m => {
       if (!m.rotationQuaternion) m.rotationQuaternion = BABYLON.Quaternion.Identity();
-      m.isVisible = false; 
-      m.isPickable = false; 
+      m.isVisible = false;
+      m.isPickable = false;
     });
-    prefabContainer.transformNodes?.forEach(tn => { 
+    prefabContainer.transformNodes?.forEach(tn => {
       if (!tn.rotationQuaternion) tn.rotationQuaternion = BABYLON.Quaternion.Identity();
     });
-
     prefabReady = true;
   } catch (e) {
-    console.error("[GLB Load Error]", e);
+    // 失败则保持 prefabReady=false,避免后续生成尝试
   }
 
   // 用容器实例化到场景(每次生成一套全新的节点)
@@ -170,7 +160,7 @@ var createScene = async function () {
     const container = new BABYLON.TransformNode("model_" + models.length, scene);
     container.__spawnContainer = true;
     container.rotationQuaternion = new BABYLON.Quaternion();
-    container.metadata = { targetYaw: 0, velPlanar: new BABYLON.Vector3(0,0,0) };
+    container.metadata = { velPlanar: new BABYLON.Vector3(0,0,0) };
 
     // 实例化:不加入场景的模板 → 生成可用的节点集合
     const inst = prefabContainer.instantiateModelsToScene(
@@ -204,7 +194,7 @@ var createScene = async function () {
       container.rotationQuaternion = rot180Y.multiply(container.rotationQuaternion);
     }
 
-    // —— 缩放:1/3 弹出动画 —— //
+    // —— 缩放:1/4 弹出动画 —— //
     const startPos = container.position.clone();
     container.scaling.set(0.001, 0.001, 0.001);
     container.setEnabled(true);
@@ -229,21 +219,6 @@ var createScene = async function () {
     container.animations = [scaleAnim, posAnim];
     scene.beginAnimation(container, 0, 12, false);
 
-    // —— “过小兜底”:如果模型尺度很小(<3cm),自动放大到 ~20cm —— //
-    scene.onBeforeRenderObservable.addOnce(() => {
-      const meshes = container.getChildMeshes();
-      if (meshes.length) {
-        const bbox = BABYLON.Mesh.MinMax(meshes);
-        const extent = bbox.max.subtract(bbox.min);
-        const maxDim = Math.max(extent.x, extent.y, extent.z);
-        if (isFinite(maxDim) && maxDim > 0 && maxDim < 0.03) {
-          const target = 0.2; // 20 cm
-          const k = target / maxDim;
-          container.scaling = container.scaling.multiplyByFloats(k, k, k);
-        }
-      }
-    });
-
     models.push(container);
     return container;
   }
@@ -256,7 +231,7 @@ var createScene = async function () {
       const trigger = motionController.getComponent("xr-standard-trigger");
       const thumbstick = motionController.getComponent("xr-standard-thumbstick");
 
-      // 摇杆:X=旋转朝向,Y=前后;松手归零
+      // 摇杆:X=水平侧移,Y=前后;松手归零
       if (thumbstick) {
         thumbstick.onAxisValueChangedObservable.add((axes) => {
           rightAxisX = axes.x || 0;
@@ -267,30 +242,12 @@ var createScene = async function () {
         });
       }
 
-      // 扳机:生成(并给诊断对照 cube)
+      // 扳机:生成
       if (trigger) {
         trigger.onButtonStateChangedObservable.add((state) => {
           if (state.changes.pressed && state.pressed && latestHitPose) {
-            let ok = false;
-            try {
-              const inst = spawnModelAtPose(latestHitPose);
-              if (inst && inst.rotationQuaternion) {
-                const eul = inst.rotationQuaternion.toEulerAngles();
-                inst.metadata.targetYaw = eul.y; // 初始化目标朝向
-                ok = true;
-              }
-            } catch(e) { ok = false; }
-            __spawnCount++; flash(ok);
-
-            if (DIAG_SPAWN_CUBE) {
-              const c = BABYLON.MeshBuilder.CreateBox("diagCube", {size:0.1}, scene);
-              applyPoseToNode(latestHitPose, c);
-              const mat = new BABYLON.StandardMaterial("m", scene);
-              // 绿色(成功)/ 红色(失败)的对照块,3秒后自动清除
-              mat.diffuseColor = new BABYLON.Color3(ok ? 0 : 1, ok ? 1 : 0, 0);
-              mat.alpha = 0.8; c.material = mat;
-              setTimeout(()=>c.dispose(), 3000);
-            }
+            const inst = spawnModelAtPose(latestHitPose);
+            // 不再设置旋转目标;纯平移控制
           }
         });
       }
@@ -328,78 +285,33 @@ var createScene = async function () {
             : null;
         } else { selectedContainer = null; }
 
-        // smooth control:仅对选中实例
+        // ==== 平面“二维移动”控制(无旋转)====
         if (selectedContainer) {
           const dt = scene.getEngine().getDeltaTime() / 1000;
-          // yaw(X轴控制)
-          const yawInput = rightAxisX, yawSpeed = 2.8;
+
+          // 基于相机的水平前向/右向
+          const { fwdPlanar, right } = getPlanarBasis();
+
+          // 输入映射:右推右移,上推前进
+          const moveSpeed = 0.6; // m/s,可按需要调
+          const vx = rightAxisX * moveSpeed;  // 侧移
+          const vz = -rightAxisY * moveSpeed; // 前后(上推为负→前进)
+
+          const desiredVel = right.scale(vx).add(fwdPlanar.scale(vz));
+
+          // 阻尼平滑
           const md = selectedContainer.metadata;
-          md.targetYaw += yawInput * yawSpeed * dt;
-          const curYaw = selectedContainer.rotationQuaternion ? selectedContainer.rotationQuaternion.toEulerAngles().y : 0;
-          const rotSmooth = 10.0;
-          const yawError = normalizeAngle(md.targetYaw - curYaw);
-          const step = 1 - Math.exp(-rotSmooth * dt);
-          const newYaw = curYaw + yawError * step;
-          selectedContainer.rotationQuaternion = BABYLON.Quaternion.FromEulerAngles(0, newYaw, 0);
-          // planar move(Y轴控制)
-          const moveInput = -rightAxisY, moveSpeed = 0.6;
-          const { fwdPlanar } = getPlanarBasis();
-          const desiredVel = fwdPlanar.scale(moveInput * moveSpeed);
           if (!md.velPlanar) md.velPlanar = new BABYLON.Vector3(0,0,0);
           const transSmooth = 8.0;
           md.velPlanar.x += (desiredVel.x - md.velPlanar.x) * (1 - Math.exp(-transSmooth * dt));
           md.velPlanar.y = 0;
           md.velPlanar.z += (desiredVel.z - md.velPlanar.z) * (1 - Math.exp(-transSmooth * dt));
+
           selectedContainer.position.addInPlace(md.velPlanar.scale(dt));
         }
       });
     });
   });
-
-  // ==== 诊断 UI(不连电脑也能看到状态)====
-  let diag = { useGUI: !!BABYLON.GUI, uiTex: null, panel: null, labels: [], dyntex: null, plane: null };
-  function setupDiagUI() {
-    if (diag.useGUI) {
-      diag.uiTex = BABYLON.GUI.AdvancedDynamicTexture.CreateFullscreenUI("diagUI", true, scene);
-      diag.panel = new BABYLON.GUI.StackPanel(); diag.panel.width = "360px";
-      diag.panel.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
-      diag.panel.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
-      diag.panel.paddingTop = "8px"; diag.panel.paddingLeft = "8px"; diag.uiTex.addControl(diag.panel);
-      function mk(){ const t=new BABYLON.GUI.TextBlock(); t.color="white"; t.fontSize=18; t.height="24px"; t.textHorizontalAlignment=0; return t; }
-      for (let i=0;i<5;i++){ const L=mk(); diag.labels.push(L); diag.panel.addControl(L); }
-    } else {
-      diag.plane = BABYLON.MeshBuilder.CreatePlane("diagPlane",{size:0.35},scene);
-      diag.plane.position = camera.position.add(new BABYLON.Vector3(0.2,0.2,0.6));
-      diag.plane.billboardMode = BABYLON.Mesh.BILLBOARDMODE_ALL;
-      const mat = new BABYLON.StandardMaterial("diagMat", scene);
-      diag.dyntex = new BABYLON.DynamicTexture("diagDT", {width:512, height:256}, scene, true);
-      mat.diffuseTexture = diag.dyntex; mat.emissiveColor = new BABYLON.Color3(1,1,1); mat.backFaceCulling=false;
-      diag.plane.material = mat;
-    }
-  }
-  setupDiagUI();
-  function setOK_GUI(label, key, ok){ label.text = `${key}: ${typeof ok==="boolean" ? (ok?"OK":"...") : ok}`; label.color = (ok===true)?"#7CFC00":(ok===false?"#FF6347":"white"); }
-  function setOK_Fallback(lines){ const ctx=diag.dyntex.getContext(); ctx.fillStyle="rgba(0,0,0,0.5)"; ctx.fillRect(0,0,512,256); ctx.fillStyle="white"; ctx.font="24px monospace"; lines.forEach((t,i)=>ctx.fillText(t,16,40+i*40)); diag.dyntex.update(); }
-  function refreshDiagUI(){
-    const lines = [
-      `GLB Loaded: ${prefabReady ? "OK" : "..."}`,
-      `Hit Pose  : ${!!latestHitPose}`,
-      `Models    : ${models.length}`,
-      `Selected  : ${!!selectedContainer}`,
-      `Spawned   : ${__spawnCount}`
-    ];
-    if (diag.useGUI) {
-      setOK_GUI(diag.labels[0], "GLB Loaded", !!prefabReady);
-      setOK_GUI(diag.labels[1], "Hit Pose", !!latestHitPose);
-      setOK_GUI(diag.labels[2], "Models", models.length);
-      setOK_GUI(diag.labels[3], "Selected", !!selectedContainer);
-      setOK_GUI(diag.labels[4], "Spawned", __spawnCount);
-    } else { setOK_Fallback(lines); }
-  }
-  function flash(ok){
-    if (diag.useGUI && diag.uiTex) { const r=new BABYLON.GUI.Rectangle(); r.thickness=0; r.width="100%"; r.height="100%"; r.background= ok?"#00800066":"#FF000066"; diag.uiTex.addControl(r); setTimeout(()=>diag.uiTex.removeControl(r),120); }
-  }
-  scene.onBeforeRenderObservable.add(refreshDiagUI);
 
   return scene;
 };
