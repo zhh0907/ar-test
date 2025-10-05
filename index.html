@@ -63,44 +63,54 @@
         var scene = null;
         var sceneToRender = null;
         var createDefaultEngine = function() { return new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true,  disableWebGL2Support: false}); };
-        const MODEL_URL = "./lp_robot.glb";
-const MODEL_FORWARD_SIGN = -1;
-const MODEL_SCALE = 1 / 3;
-const DIAG_SPAWN_CUBE = true;
+        // ===== 常量:使用“绝对 URL” =====
+// 👉 请把下面 URL 换成你自己的在线地址(https/可直连的 .glb)
+const MODEL_URL = "https://your.cdn.com/path/to/lp_robot.glb";
+const MODEL_FORWARD_SIGN = -1; // -1: 模型前向就是 -Z;+1: 原始为 +Z,需要额外旋转180°
+const MODEL_SCALE = 1;     // 统一缩放到 1/3
+const DIAG_SPAWN_CUBE = true;  // 诊断:同时生成绿色 cube 作为对照(3s 自动消失)
 
 var createScene = async function () {
   const scene = new BABYLON.Scene(engine);
 
-  // Camera & Light
+  // --- Camera & Light ---
   const camera = new BABYLON.FreeCamera("camera1", new BABYLON.Vector3(0, 1, -5), scene);
   camera.setTarget(BABYLON.Vector3.Zero());
   camera.attachControl(canvas, true);
+
   const light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
   light.intensity = 0.9;
+
+  // 右手系
   scene.useRightHandedSystem = true;
 
-  // XR
+  // --- XR (AR) ---
   const xr = await scene.createDefaultXRExperienceAsync({
     uiOptions: { sessionMode: "immersive-ar" },
     optionalFeatures: true
   });
+
+  // 禁用会劫持摇杆移动视角的特性
   const fm = xr.baseExperience.featuresManager;
   try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION); } catch {}
   try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); } catch {}
+  // 如仍冲突可再禁用指针选择:
+  // try { fm.disableFeature(BABYLON.WebXRFeatureName.POINTER_SELECTION); } catch {}
 
-  // State
-  const models = [];
+  // ---------- 运行状态 ----------
+  const models = [];          // TransformNode 容器列表(每个实例一个容器)
   let selectedContainer = null;
   let latestHitPose = null;
-  let rightAxisX = 0, rightAxisY = 0;
+  let rightAxisX = 0;         // 右摇杆X:旋转朝向
+  let rightAxisY = 0;         // 右摇杆Y:前后平移
   let __spawnCount = 0;
 
-  // Marker
+  // ---------- 命中标记(小甜甜圈) ----------
   const marker = BABYLON.MeshBuilder.CreateTorus("marker", { diameter: 0.06, thickness: 0.01 }, scene);
   marker.isVisible = false;
   marker.rotationQuaternion = new BABYLON.Quaternion();
 
-  // Utils
+  // ---------- 工具 ----------
   function applyPoseToNode(pose, node) {
     const { position, orientation } = pose.transform;
     node.position.set(position.x, position.y, position.z);
@@ -112,34 +122,41 @@ var createScene = async function () {
     const t = BABYLON.Vector3.Cross(qv, v).scale(2.0);
     return v.add(t.scale(q.w)).add(BABYLON.Vector3.Cross(qv, t));
   }
-  function findSpawnContainer(node) { let n = node; while (n) { if (n.__spawnContainer) return n; n = n.parent; } return null; }
+  function findSpawnContainer(node) {
+    let n = node;
+    while (n) { if (n.__spawnContainer) return n; n = n.parent; }
+    return null;
+  }
   function getPlanarBasis() {
-    const up = new BABYLON.Vector3(0,1,0);
+    const up = new BABYLON.Vector3(0, 1, 0);
     const camFwd = camera.getDirection(BABYLON.Axis.Z).normalize();
     const fwdPlanar = camFwd.subtract(up.scale(BABYLON.Vector3.Dot(camFwd, up))).normalize();
     let right = BABYLON.Vector3.Cross(up, fwdPlanar).normalize();
-    if (!isFinite(right.length()) || right.length() < 1e-3) right = new BABYLON.Vector3(1,0,0);
+    if (!isFinite(right.length()) || right.length() < 1e-3) right = new BABYLON.Vector3(1, 0, 0);
     return { fwdPlanar, right };
   }
-  function normalizeAngle(a){ while(a>Math.PI)a-=Math.PI*2; while(a<-Math.PI)a+=Math.PI*2; return a; }
+  function normalizeAngle(a) {
+    while (a > Math.PI) a -= Math.PI * 2;
+    while (a < -Math.PI) a += Math.PI * 2;
+    return a;
+  }
 
-  // ====== 关键改动:用 AssetContainer 做“模板”,不加入场景,按需实例化 ======
+  // ====== 关键:用 AssetContainer 做“模板”,不加入场景,按需实例化 ======
   let prefabContainer = null;
   let prefabReady = false;
   try {
     // 直接把 GLB 装进 AssetContainer(不 addAllToScene)
     prefabContainer = await BABYLON.SceneLoader.LoadAssetContainerAsync("", MODEL_URL, scene);
 
-    // 前向对齐:把旋转写到容器里的“临时根”上
-    // 创建一个虚拟root,承接容器中所有顶层节点,避免对原始节点逐个处理
-    const virtualRoot = new BABYLON.TransformNode("prefabVirtualRoot", scene);
-    virtualRoot.rotationQuaternion = BABYLON.Quaternion.Identity();
-    if (MODEL_FORWARD_SIGN === +1) {
-      virtualRoot.rotationQuaternion = BABYLON.Quaternion.FromEulerAngles(0, Math.PI, 0);
-    }
-    // 把容器的所有顶层节点挂到 virtualRoot 下
-    prefabContainer.meshes.forEach(m => { if (!m.parent) m.parent = virtualRoot; if (!m.rotationQuaternion) m.rotationQuaternion = BABYLON.Quaternion.Identity(); m.isVisible = false; m.isPickable = false; });
-    prefabContainer.transformNodes?.forEach(tn => { if (!tn.parent) tn.parent = virtualRoot; if (!tn.rotationQuaternion) tn.rotationQuaternion = BABYLON.Quaternion.Identity(); });
+    // 只把“容器内的原件”标成模板态(不可见/不拾取),不改 parent,不禁用
+    prefabContainer.meshes.forEach(m => { 
+      if (!m.rotationQuaternion) m.rotationQuaternion = BABYLON.Quaternion.Identity();
+      m.isVisible = false; 
+      m.isPickable = false; 
+    });
+    prefabContainer.transformNodes?.forEach(tn => { 
+      if (!tn.rotationQuaternion) tn.rotationQuaternion = BABYLON.Quaternion.Identity();
+    });
 
     prefabReady = true;
   } catch (e) {
@@ -155,8 +172,12 @@ var createScene = async function () {
     container.rotationQuaternion = new BABYLON.Quaternion();
     container.metadata = { targetYaw: 0, velPlanar: new BABYLON.Vector3(0,0,0) };
 
-    // 关键:用容器实例化
-    const inst = prefabContainer.instantiateModelsToScene(name => container.name + "_inst_" + name, false);
+    // 实例化:不加入场景的模板 → 生成可用的节点集合
+    const inst = prefabContainer.instantiateModelsToScene(
+      name => container.name + "_inst_" + name,
+      false  // cloneMaterials=false(共享材质)
+    );
+
     // 把所有 rootNodes 收拢到容器下,并显式启用+可见
     inst.rootNodes.forEach(rn => {
       rn.parent = container;
@@ -174,14 +195,25 @@ var createScene = async function () {
       });
     });
 
-    // 应用姿态 + 弹出到 1/3 缩放
+    // 应用姿态
     applyPoseToNode(pose, container);
+
+    // 若模型原始“前向 = +Z”,按你的约定给容器绕Y旋转180度
+    if (MODEL_FORWARD_SIGN === +1) {
+      const rot180Y = BABYLON.Quaternion.FromEulerAngles(0, Math.PI, 0);
+      container.rotationQuaternion = rot180Y.multiply(container.rotationQuaternion);
+    }
+
+    // —— 缩放:1/3 弹出动画 —— //
     const startPos = container.position.clone();
     container.scaling.set(0.001, 0.001, 0.001);
     container.setEnabled(true);
 
-    const scaleAnim = new BABYLON.Animation("spawnScale", "scaling", 60, BABYLON.Animation.ANIMATIONTYPE_VECTOR3, BABYLON.Animation.ANIMATIONLOOPMODE_CONSTANT);
-    const posAnim   = new BABYLON.Animation("spawnPos",   "position", 60, BABYLON.Animation.ANIMATIONTYPE_VECTOR3, BABYLON.Animation.ANIMATIONLOOPMODE_CONSTANT);
+    const scaleAnim = new BABYLON.Animation("spawnScale", "scaling", 60,
+      BABYLON.Animation.ANIMATIONTYPE_VECTOR3, BABYLON.Animation.ANIMATIONLOOPMODE_CONSTANT);
+    const posAnim   = new BABYLON.Animation("spawnPos",   "position", 60,
+      BABYLON.Animation.ANIMATIONTYPE_VECTOR3, BABYLON.Animation.ANIMATIONLOOPMODE_CONSTANT);
+
     scaleAnim.setKeys([
       { frame: 0,  value: new BABYLON.Vector3(0.001,0.001,0.001) },
       { frame: 6,  value: new BABYLON.Vector3(MODEL_SCALE*1.08, MODEL_SCALE*1.08, MODEL_SCALE*1.08) },
@@ -197,22 +229,45 @@ var createScene = async function () {
     container.animations = [scaleAnim, posAnim];
     scene.beginAnimation(container, 0, 12, false);
 
+    // —— “过小兜底”:如果模型尺度很小(<3cm),自动放大到 ~20cm —— //
+    scene.onBeforeRenderObservable.addOnce(() => {
+      const meshes = container.getChildMeshes();
+      if (meshes.length) {
+        const bbox = BABYLON.Mesh.MinMax(meshes);
+        const extent = bbox.max.subtract(bbox.min);
+        const maxDim = Math.max(extent.x, extent.y, extent.z);
+        if (isFinite(maxDim) && maxDim > 0 && maxDim < 0.03) {
+          const target = 0.2; // 20 cm
+          const k = target / maxDim;
+          container.scaling = container.scaling.multiplyByFloats(k, k, k);
+        }
+      }
+    });
+
     models.push(container);
     return container;
   }
 
-  // Controller
+  // ---------- 控制器 ----------
   xr.input.onControllerAddedObservable.add(async (controller) => {
     controller.onMotionControllerInitObservable.add(async (motionController) => {
       if (motionController.handedness !== "right") return;
+
       const trigger = motionController.getComponent("xr-standard-trigger");
       const thumbstick = motionController.getComponent("xr-standard-thumbstick");
 
+      // 摇杆:X=旋转朝向,Y=前后;松手归零
       if (thumbstick) {
-        thumbstick.onAxisValueChangedObservable.add((axes) => { rightAxisX = axes.x || 0; rightAxisY = axes.y || 0; });
-        thumbstick.onButtonStateChangedObservable.add((state) => { if (!state.pressed) { rightAxisX = 0; rightAxisY = 0; }});
+        thumbstick.onAxisValueChangedObservable.add((axes) => {
+          rightAxisX = axes.x || 0;
+          rightAxisY = axes.y || 0;
+        });
+        thumbstick.onButtonStateChangedObservable.add((state) => {
+          if (!state.pressed) { rightAxisX = 0; rightAxisY = 0; }
+        });
       }
 
+      // 扳机:生成(并给诊断对照 cube)
       if (trigger) {
         trigger.onButtonStateChangedObservable.add((state) => {
           if (state.changes.pressed && state.pressed && latestHitPose) {
@@ -221,7 +276,7 @@ var createScene = async function () {
               const inst = spawnModelAtPose(latestHitPose);
               if (inst && inst.rotationQuaternion) {
                 const eul = inst.rotationQuaternion.toEulerAngles();
-                inst.metadata.targetYaw = eul.y;
+                inst.metadata.targetYaw = eul.y; // 初始化目标朝向
                 ok = true;
               }
             } catch(e) { ok = false; }
@@ -231,6 +286,7 @@ var createScene = async function () {
               const c = BABYLON.MeshBuilder.CreateBox("diagCube", {size:0.1}, scene);
               applyPoseToNode(latestHitPose, c);
               const mat = new BABYLON.StandardMaterial("m", scene);
+              // 绿色(成功)/ 红色(失败)的对照块,3秒后自动清除
               mat.diffuseColor = new BABYLON.Color3(ok ? 0 : 1, ok ? 1 : 0, 0);
               mat.alpha = 0.8; c.material = mat;
               setTimeout(()=>c.dispose(), 3000);
@@ -272,10 +328,10 @@ var createScene = async function () {
             : null;
         } else { selectedContainer = null; }
 
-        // smooth control
+        // smooth control:仅对选中实例
         if (selectedContainer) {
           const dt = scene.getEngine().getDeltaTime() / 1000;
-          // yaw
+          // yaw(X轴控制)
           const yawInput = rightAxisX, yawSpeed = 2.8;
           const md = selectedContainer.metadata;
           md.targetYaw += yawInput * yawSpeed * dt;
@@ -285,7 +341,7 @@ var createScene = async function () {
           const step = 1 - Math.exp(-rotSmooth * dt);
           const newYaw = curYaw + yawError * step;
           selectedContainer.rotationQuaternion = BABYLON.Quaternion.FromEulerAngles(0, newYaw, 0);
-          // planar move
+          // planar move(Y轴控制)
           const moveInput = -rightAxisY, moveSpeed = 0.6;
           const { fwdPlanar } = getPlanarBasis();
           const desiredVel = fwdPlanar.scale(moveInput * moveSpeed);
@@ -300,7 +356,7 @@ var createScene = async function () {
     });
   });
 
-  // ==== 诊断 UI(与之前一致)====
+  // ==== 诊断 UI(不连电脑也能看到状态)====
   let diag = { useGUI: !!BABYLON.GUI, uiTex: null, panel: null, labels: [], dyntex: null, plane: null };
   function setupDiagUI() {
     if (diag.useGUI) {
