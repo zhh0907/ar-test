@@ -63,433 +63,129 @@
         var scene = null;
         var sceneToRender = null;
         var createDefaultEngine = function() { return new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true,  disableWebGL2Support: false}); };
-        // ===== 配置你的 GLB 文件路径 =====
-const MODEL_URL = "./lp_robot.glb";
-// 大多数 GLTF 模型“向前”为 -Z;若你的模型向前是 +Z,把它改成 +1
-const MODEL_FORWARD_SIGN = -1; // -1: -Z 前向(常见);+1: +Z 前向
-
-// 移动时的朝向插值速度(弧度/秒),越大转身越快
-const ROT_LERP_SPEED = 10.0;
-
-var createScene = async function () {
+        var createScene = async function () {
   const scene = new BABYLON.Scene(engine);
-  scene.clearColor = new BABYLON.Color4(0, 0, 0, 0); // AR 透视
 
-  // --- Camera & Light ---
-  const camera = new BABYLON.FreeCamera("camera1", new BABYLON.Vector3(0, 5, -6), scene);
+  // Camera & light
+  const camera = new BABYLON.FreeCamera("camera1", new BABYLON.Vector3(0, 1, -5), scene);
   camera.setTarget(BABYLON.Vector3.Zero());
   camera.attachControl(canvas, true);
-  const light = new BABYLON.HemisphericLight("light1", new BABYLON.Vector3(0,1,0), scene);
-  light.intensity = 0.9;
 
-  // --- Ground:线可见、底几乎透明 ---
-  const ground = BABYLON.MeshBuilder.CreateGround("myGround", { width: 30, height: 30 }, scene);
-  ground.position.y = 0;
-  ground.isPickable = true;
+  const light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
+  light.intensity = 0.7;
 
-  const gridMat = new BABYLON.GridMaterial("gridMat", scene);
-  gridMat.gridRatio = 1.0;
-  gridMat.majorUnitFrequency = 4;
-  gridMat.minorUnitVisibility = 0.9;               // 线更清晰
-  gridMat.lineColor = new BABYLON.Color3(1.0, 1.0, 1.0);
-  gridMat.mainColor = new BABYLON.Color3(0, 0, 0);
-  gridMat.opacity = 0.03;                           // 留极小不透明以稳定渲染线条
-  gridMat.alpha = gridMat.opacity;
-  gridMat.disableLighting = true;
-  gridMat.transparencyMode = BABYLON.Material.MATERIAL_ALPHABLEND;
-  gridMat.backFaceCulling = false;
-  gridMat.zOffset = -1;
-  ground.material = gridMat;
+  scene.useRightHandedSystem = true;
 
-  // --- Highlight(悬停/锁定) ---
-  const hl = new BABYLON.HighlightLayer("hl", scene);
-  hl.innerGlow = false; hl.outerGlow = true;
-  hl.blurHorizontalSize = 1.0; hl.blurVerticalSize = 1.0;
-  const HLCOLOR = new BABYLON.Color3(1.0, 0.85, 0.3);
-
-  // --- 预载 GLB ---
-  const glbContainer = await BABYLON.SceneLoader.LoadAssetContainerAsync("", MODEL_URL, scene);
-  glbContainer.removeAllFromScene();
-
-  // --- XR:AR 优先,VR 回退 & 禁用内置移动/传送 ---
-  let xr;
-  try {
-    const supportsAR = await BABYLON.WebXRSessionManager.IsSessionSupportedAsync("immersive-ar");
-    if (!supportsAR) throw new Error("no AR");
-    xr = await scene.createDefaultXRExperienceAsync({
-      sessionMode: "immersive-ar",
-      referenceSpaceType: "local-floor",
-      uiOptions: { sessionMode: "immersive-ar" },
-      optionalFeatures: true
-    });
-    xr.baseExperience.featuresManager.enableFeature(
-      BABYLON.WebXRBackgroundRemover.Name, "latest",
-      { environmentHelperRemoval: true, skyBoxRemoval: true }
-    );
-    const fm = xr.baseExperience.featuresManager;
-    try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); } catch {}
-    try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION); } catch {}
-  } catch {
-    xr = await scene.createDefaultXRExperienceAsync({
-      sessionMode: "immersive-vr",
-      referenceSpaceType: "local-floor",
-      uiOptions: { sessionMode: "immersive-vr" }
-    });
-    scene.createDefaultEnvironment({ createGround:false, createSkybox:true, enableGroundShadow:true });
-    scene.clearColor = new BABYLON.Color4(0,0,0,1);
-    const fm = xr.baseExperience.featuresManager;
-    try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); } catch {}
-    try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION); } catch {}
-  }
-
-  // ====== 状态 ======
-  let rightCtrl = null, leftCtrl = null;
-  let hoveredRoot = null, lockedRoot = null;
-
-  let stickX = 0, stickY = 0;
-  let lastClickAt = 0;                // 点击时间戳
-  const CLICK_DEBOUNCE_MS = 250;      // 点击去抖窗口
-
-  const DEADZONE_IN  = 0.15;
-  const DEADZONE_OUT = 0.10;
-  let   inputActive  = false;
-
-  const MAX_SPEED = 2.2;
-  const ACCEL_ON  = 14.0;
-  const ACCEL_OFF = 4.0;
-  const DIR_LERP  = 12.0;
-  let   curSpeed  = 0.0;
-  let   moveDir   = new BABYLON.Vector3(0,0,0);
-
-  // 生成防抖
-  let rightTriggerDown = false;
-  let lastSpawnAt = 0;
-  const MIN_INTERVAL = 150;
-
-  // === 新增:全局已生成网格集合(强保证拾取) ===
-  const spawnedMeshes = new Set();   // 存放 AbstractMesh(只放生成物的网格)
-  const spawnedRoots  = new Set();   // 可选:根集合(备用)
-
-  // ====== 工具:拾取/贴地/朝向 ======
-  function rayFromController(ctrl, length = 100) {
-    const origin = ctrl.pointer.position.clone();
-    const fwd = BABYLON.Vector3.TransformNormal(BABYLON.Axis.Z, ctrl.pointer.getWorldMatrix()).normalize();
-    return new BABYLON.Ray(origin, fwd, length);
-  }
-
-  function angleDelta(a, b) {
-    let d = a - b;
-    while (d >  Math.PI) d -= Math.PI * 2;
-    while (d < -Math.PI) d += Math.PI * 2;
-    return d;
-  }
-
-  function faceDirSmooth(root, dir, dt) {
-    if (!root || dir.lengthSquared() < 1e-6) return;
-    const yawTarget = (MODEL_FORWARD_SIGN === +1)
-      ? Math.atan2(dir.x, dir.z) + Math.PI
-      : Math.atan2(dir.x, dir.z);
-    root.rotationQuaternion = null;
-    const yawNow = root.rotation.y || 0;
-    const maxStep = ROT_LERP_SPEED * dt;
-    const d = angleDelta(yawTarget, yawNow);
-    root.rotation.y = Math.abs(d) <= maxStep ? yawTarget : yawNow + Math.sign(d) * maxStep;
-  }
-
-  function faceDirImmediate(root, dir) {
-    if (!root || dir.lengthSquared() < 1e-6) return;
-    let yaw = Math.atan2(dir.x, dir.z);
-    if (MODEL_FORWARD_SIGN === +1) yaw += Math.PI;
-    root.rotationQuaternion = null;
-    root.rotation.y = yaw;
-  }
-
-  function faceUserYaw(root) {
-    const cam = (xr && xr.baseExperience && xr.baseExperience.camera) || scene.activeCamera;
-    if (!cam) return;
-    const dir = cam.globalPosition.subtract(root.position); // 模型→相机向量
-    let yaw = Math.atan2(dir.x, dir.z);
-    if (MODEL_FORWARD_SIGN === +1) yaw += Math.PI;
-    root.rotationQuaternion = null;
-    root.rotation.y = yaw;
-  }
-
-  function getWorldMinMaxY(root) {
-    let minY = +Infinity, maxY = -Infinity;
-    root.getChildMeshes().forEach((m) => {
-      const bb = m.getBoundingInfo().boundingBox;
-      const vmin = bb.minimumWorld, vmax = bb.maximumWorld;
-      if (vmin.y < minY) minY = vmin.y;
-      if (vmax.y > maxY) maxY = vmax.y;
-    });
-    return { minY, maxY };
-  }
-
-  function placeRootOnGround(root, groundY) {
-    const { minY } = getWorldMinMaxY(root);
-    const delta = groundY - minY;
-    root.position.y += delta;
-    root.metadata.bottomOffset = (root.position.y - minY);
-  }
-
-  // —— 回溯“生成根”:看是否到达带 isSpawnedModel 标记的 TransformNode —— 
-  function findSpawnedRoot(node) {
-    let cur = node;
-    while (cur) {
-      if (cur.metadata && cur.metadata.isSpawnedModel) return cur;
-      cur = cur.parent;
-    }
-    return null;
-  }
-
-  function setRootHighlight(root, on) {
-    const meshes = root.getChildMeshes();
-    if (on) meshes.forEach(m => hl.addMesh(m, HLCOLOR));
-    else    meshes.forEach(m => hl.removeMesh(m));
-  }
-
-  // 实例化 GLB
-  function instantiateModel(name, scene) {
-    const inst = glbContainer.instantiateModelsToScene((src) => `${name}_${src}`, false);
-    const root = new BABYLON.TransformNode(`${name}_root`, scene);
-
-    root.metadata = root.metadata || {};
-    root.metadata.isSpawnedModel = true;
-    root.metadata.inst = inst;
-    root.metadata.bottomOffset = 0;
-    root.metadata.animPlaying = false;
-
-    // 将 glb 的各 rootNodes 接入统一根
-    inst.rootNodes.forEach((n) => { n.parent = root; });
-
-    // 把所有子网格加入 spawnedMeshes(稳定拾取集合)
-    root.getChildMeshes().forEach((m) => {
-      m.isPickable = true;
-      spawnedMeshes.add(m);
-    });
-    spawnedRoots.add(root);
-
-    return root;
-  }
-
-  // 动画控制
-  function clipPick(groups, ks) {
-    const kw = ks.map(k => k.toLowerCase());
-    const out = groups.filter(g => kw.some(k => g.name.toLowerCase().includes(k)));
-    return out.length ? out : null;
-  }
-  function stopToStatic(root) {
-    const inst = root?.metadata?.inst; if (!inst) return;
-    const groups = inst.animationGroups || [];
-    groups.forEach(ag => { ag.stop(); ag.reset(); ag.goToFrame(ag.from); });
-    const idle = clipPick(groups, ["idle"]);
-    if (idle) idle.forEach(ag => { ag.stop(); ag.reset(); ag.goToFrame(ag.from); });
-    else if (groups[0]) { groups[0].stop(); groups[0].reset(); groups[0].goToFrame(groups[0].from); }
-    root.metadata.animPlaying = false;
-  }
-  function playMovingLoop(root) {
-    const inst = root?.metadata?.inst; if (!inst) return;
-    const groups = inst.animationGroups || []; if (!groups.length) return;
-    groups.forEach(ag => { ag.stop(); ag.reset(); ag.goToFrame(ag.from); });
-    let playList = clipPick(groups, ["walk","move","run"]);
-    if (!playList) playList = clipPick(groups, ["idle"]);
-    if (!playList) playList = groups;
-    playList.forEach(ag => ag.start(true, 1.0, ag.from, ag.to));
-    root.metadata.animPlaying = true;
-  }
-
-  // 控制器 yaw 的水平基向量
-  const tmpR = new BABYLON.Vector3(), tmpF = new BABYLON.Vector3(), tmpStickDir = new BABYLON.Vector3();
-  function horizontalBasis(ctrl) {
-    const m = ctrl.pointer.getWorldMatrix();
-    tmpR.copyFrom(BABYLON.Vector3.TransformNormal(BABYLON.Axis.X, m));
-    tmpF.copyFrom(BABYLON.Vector3.TransformNormal(BABYLON.Axis.Z, m)).scaleInPlace(-1);
-    tmpR.y = 0; tmpF.y = 0;
-    if (tmpR.lengthSquared() < 1e-6) tmpR.copyFrom(BABYLON.Axis.X);
-    if (tmpF.lengthSquared() < 1e-6) tmpF.copyFrom(BABYLON.Axis.Z);
-    tmpR.normalize(); tmpF.normalize();
-    return { right: tmpR, fwd: tmpF };
-  }
-  function worldDirFromStick(ctrl, sx, sy) {
-    const { right: R, fwd: F } = horizontalBasis(ctrl);
-    tmpStickDir.copyFrom(R).scaleInPlace(sx).addInPlace(F.scale(sy));
-    tmpStickDir.y = 0;
-    if (tmpStickDir.lengthSquared() > 1e-6) tmpStickDir.normalize();
-    return tmpStickDir;
-  }
-
-  // 生成实例
-  function spawnModelAt(point) {
-    const root = instantiateModel("spawnedModel", scene);
-    root.position.copyFrom(point);
-    faceUserYaw(root);
-    placeRootOnGround(root, ground.position.y);
-    stopToStatic(root);
-
-    // 弹入动画
-    root.scaling.set(0.01,0.01,0.01);
-    BABYLON.Animation.CreateAndStartAnimation(
-      "popIn", root, "scaling", 60, 10,
-      new BABYLON.Vector3(0.01,0.01,0.01), new BABYLON.Vector3(1,1,1),
-      BABYLON.Animation.ANIMATIONLOOPMODE_CONSTANT
-    );
-    return root;
-  }
-
-  // 悬停/锁定
-  function setHoveredRoot(rootOrNull) {
-    if (lockedRoot) return;
-    if (hoveredRoot === rootOrNull) return;
-    if (hoveredRoot) setRootHighlight(hoveredRoot, false);
-    hoveredRoot = rootOrNull || null;
-    if (hoveredRoot) setRootHighlight(hoveredRoot, true);
-  }
-  function lockCurrentHovered() {
-    if (!hoveredRoot) return;
-    setRootHighlight(hoveredRoot, false);
-    lockedRoot = hoveredRoot;
-    hoveredRoot = null;
-    setRootHighlight(lockedRoot, true);
-  }
-  function unlockCurrent() {
-    if (!lockedRoot) return;
-    setRootHighlight(lockedRoot, false);
-    lockedRoot = null;
-  }
-
-  // ====== 控制器事件 ======
-  xr.input.onControllerAddedObservable.add((controller) => {
-    controller.onMotionControllerInitObservable.add((mc) => {
-      const hand = mc.handness;
-      if (hand === "right") rightCtrl = controller;
-      if (hand === "left")  leftCtrl  = controller;
-
-      if (hand === "right") {
-        // 右扳机:在 ground 上生成 GLB
-        const trigger = mc.getComponent("xr-standard-trigger");
-        if (trigger) {
-          trigger.onButtonStateChangedObservable.add(() => {
-            const pressed = !!trigger.pressed;
-            if (pressed && !rightTriggerDown) {
-              rightTriggerDown = true;
-              const now = performance.now();
-              if (now - lastSpawnAt > MIN_INTERVAL && rightCtrl) {
-                lastSpawnAt = now;
-                const ray = rayFromController(rightCtrl);
-                const hit = scene.pickWithRay(ray, (m) => m === ground);
-                if (hit?.hit) spawnModelAt(hit.pickedPoint);
-              }
-            } else if (!pressed && rightTriggerDown) {
-              rightTriggerDown = false;
-            }
-          });
-        }
-
-        // 右摇杆:一次点击 = 未锁定→锁定并开动;已锁定→停并解锁
-        const stick = mc.getComponent("xr-standard-thumbstick");
-        if (stick) {
-          stick.onAxisValueChangedObservable.add((axes) => {
-            stickX = axes.x || 0;
-            stickY = axes.y || 0;
-          });
-
-          let lastPressed = false;
-
-          stick.onButtonStateChangedObservable.add(() => {
-            const pressed = !!stick.pressed;
-
-            if (pressed && !lastPressed) {
-              const now = performance.now();
-              if (now - lastClickAt >= CLICK_DEBOUNCE_MS) {
-                lastClickAt = now;
-
-                if (!lockedRoot) {
-                  if (hoveredRoot) {
-                    lockCurrentHovered();
-                    playMovingLoop(lockedRoot);
-                    const dir = worldDirFromStick(rightCtrl, stickX, stickY);
-                    if (dir.lengthSquared() > 1e-6) {
-                      faceDirImmediate(lockedRoot, dir);
-                    }
-                  }
-                } else {
-                  stopToStatic(lockedRoot);
-                  unlockCurrent();
-                  stickX = 0; stickY = 0;
-                  inputActive = false;
-                  curSpeed = 0;
-                  moveDir.set(0,0,0);
-                }
-              }
-            }
-
-            lastPressed = pressed;
-          });
-        }
-      }
-    });
+  // WebXR AR session
+  const xr = await scene.createDefaultXRExperienceAsync({
+    uiOptions: { sessionMode: "immersive-ar" },
+    optionalFeatures: true
   });
 
-  xr.input.onControllerRemovedObservable.add((controller) => {
-    if (controller === rightCtrl) { rightCtrl = null; stickX = stickY = 0; }
-    if (controller === leftCtrl)  { leftCtrl  = null; }
-    setHoveredRoot(null);
-    unlockCurrent();
-  });
+  // Shared state
+  const cubes = [];
+  let selectedMesh = null;
+  let latestHitPose = null;
+  let rightThumbstickX = 0;
 
-  // ====== 帧更新 ======
-  scene.onBeforeRenderObservable.add(() => {
-    const dt = scene.getEngine().getDeltaTime() / 1000;
+  // Template cube and marker
+  const cubeTemplate = BABYLON.MeshBuilder.CreateBox("cubeTemplate", { size: 0.1 }, scene);
+  cubeTemplate.isVisible = false;
+  cubeTemplate.isPickable = true;
 
-    // 悬停(未锁定):只在 spawnedMeshes 集合里做拾取
-    if (!lockedRoot && rightCtrl) {
-      const ray = rayFromController(rightCtrl);
-      // 最近的“生成网格”命中
-      const hits = scene.multiPickWithRay(ray, (m) => spawnedMeshes.has(m));
-      const top = (hits && hits.length) ? hits[0] : null;
-      const root = top ? findSpawnedRoot(top.pickedMesh) : null;
-      setHoveredRoot(root);
-    }
+  const marker = BABYLON.MeshBuilder.CreateTorus("marker", { diameter: 0.15, thickness: 0.05 }, scene);
+  marker.isVisible = false;
+  marker.rotationQuaternion = new BABYLON.Quaternion();
 
-    // 锁定时:右摇杆控制移动 + 朝向摇杆方向
-    if (lockedRoot && rightCtrl) {
-      const mag = Math.hypot(stickX, stickY);
-      if (!inputActive) { if (mag > DEADZONE_IN) inputActive = true; }
-      else              { if (mag < DEADZONE_OUT) inputActive = false; }
+  function applyPoseToNode(pose, node) {
+    const { position, orientation } = pose.transform;
+    node.position.set(position.x, position.y, position.z);
+    node.rotationQuaternion.set(orientation.x, orientation.y, orientation.z, orientation.w);
+  }
 
-      const stickDir = worldDirFromStick(rightCtrl, stickX, stickY);
-      if (stickDir.lengthSquared() > 1e-6) {
-        faceDirSmooth(lockedRoot, stickDir, dt);
+  function v3RotateByQuat(v, q) {
+    // v' = v + 2*cross(q.xyz, cross(q.xyz, v) + q.w*v)
+    const qv = new BABYLON.Vector3(q.x, q.y, q.z);
+    const t = BABYLON.Vector3.Cross(qv, v).scale(2.0);
+    return v.add(t.scale(q.w)).add(BABYLON.Vector3.Cross(qv, t));
+  }
+
+  xr.input.onControllerAddedObservable.add(async (controller) => {
+    controller.onMotionControllerInitObservable.add(async (motionController) => {
+      if (motionController.handedness !== "right") return;
+
+      const trigger = motionController.getComponent("xr-standard-trigger");
+      const thumbstick = motionController.getComponent("xr-standard-thumbstick");
+
+      if (thumbstick) {
+        thumbstick.onAxisValueChangedObservable.add((axes) => {
+          rightThumbstickX = axes.x || 0;
+        });
+        thumbstick.onButtonStateChangedObservable.add((state) => {
+          if (!state.pressed) rightThumbstickX = 0;
+        });
       }
 
-      const { right: R, fwd: F } = horizontalBasis(rightCtrl);
-      let targetDir = moveDir.clone();
-      let targetSpeed = 0;
-
-      if (inputActive) {
-        targetDir = R.scale(stickX).addInPlace(F.scale(stickY));
-        targetDir.y = 0;
-        if (targetDir.lengthSquared() > 1e-6) targetDir.normalize();
-        targetSpeed = MAX_SPEED * Math.min(1, mag);
+      if (trigger) {
+        trigger.onButtonStateChangedObservable.add((state) => {
+          if (state.changes.pressed && state.pressed && latestHitPose) {
+            const newCube = cubeTemplate.clone("cube");
+            newCube.isVisible = true;
+            newCube.isPickable = true;
+            applyPoseToNode(latestHitPose, newCube);
+            cubes.push(newCube);
+          }
+        });
       }
 
-      if (targetDir.lengthSquared() > 1e-6) {
-        const a = Math.min(1, DIR_LERP * dt);
-        moveDir.x += (targetDir.x - moveDir.x) * a;
-        moveDir.z += (targetDir.z - moveDir.z) * a;
-        if (moveDir.lengthSquared() > 1e-6) moveDir.normalize();
-      }
-      const accel = inputActive ? ACCEL_ON : ACCEL_OFF;
-      curSpeed += (targetSpeed - curSpeed) * Math.min(1, accel * dt);
+      // Hit test based on right target ray
+      const session = xr.baseExperience.sessionManager.session;
+      const refSpace = xr.baseExperience.sessionManager.referenceSpace;
+      const hitTestSource = await session.requestHitTestSource({
+        space: controller.inputSource.targetRaySpace,
+      });
 
-      if (curSpeed > 1e-4 && moveDir.lengthSquared() > 1e-6) {
-        const delta = moveDir.scale(curSpeed * dt);
-        const newPos = lockedRoot.position.add(delta);
-        const bottomOffset = lockedRoot.metadata.bottomOffset ?? 0;
-        newPos.y = ground.position.y + bottomOffset;  // 贴地
-        lockedRoot.position.copyFrom(newPos);
-      }
-    }
+      xr.baseExperience.sessionManager.onXRFrameObservable.add((xrFrame) => {
+        // 1) Hit test
+        const results = xrFrame.getHitTestResults(hitTestSource);
+        if (results.length) {
+          const pose = results[0].getPose(refSpace);
+          if (pose) {
+            latestHitPose = pose;
+            marker.isVisible = true;
+            applyPoseToNode(pose, marker);
+          }
+        } else {
+          marker.isVisible = false;
+        }
+
+        // 2) Build picking ray from right target ray
+        const tgtPose = xrFrame.getPose(controller.inputSource.targetRaySpace, refSpace);
+        if (tgtPose) {
+          const o = tgtPose.transform.position;
+          const origin = new BABYLON.Vector3(o.x, o.y, o.z);
+          const q = tgtPose.transform.orientation;
+          const rot = new BABYLON.Quaternion(q.x, q.y, q.z, q.w);
+          const forward = new BABYLON.Vector3(0, 0, -1);
+          const dir = v3RotateByQuat(forward, rot).normalize();
+          const ray = new BABYLON.Ray(origin, dir, 10.0);
+
+          const pick = scene.pickWithRay(ray, (m) => m && m.isPickable && cubes.indexOf(m) !== -1);
+          selectedMesh = (pick && pick.hit) ? pick.pickedMesh : null;
+        } else {
+          selectedMesh = null;
+        }
+
+        // 3) Move selected with thumbstick X
+        if (selectedMesh && Math.abs(rightThumbstickX) > 0.02) {
+          const dt = scene.getEngine().getDeltaTime() / 1000;
+          const speed = 0.4;
+          const delta = new BABYLON.Vector3(rightThumbstickX * speed * dt, 0, 0);
+          selectedMesh.position.addInPlace(delta);
+
+        }
+      });
+    });
   });
 
   return scene;
