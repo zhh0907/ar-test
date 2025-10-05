@@ -66,7 +66,7 @@
         // ===== 常量:使用 URL =====
 const MODEL_URL = "./lp_robot.glb";
 const MODEL_FORWARD_SIGN = -1; // -1: 模型前向就是 -Z;+1: 原始为 +Z,需要额外旋转180°
-const MODEL_SCALE = 1 / 4;     // 统一缩放到 1/4
+const MODEL_SCALE = 1 / 5;     // 统一缩放到 1/4
 
 var createScene = async function () {
   const scene = new BABYLON.Scene(engine);
@@ -92,8 +92,6 @@ var createScene = async function () {
   const fm = xr.baseExperience.featuresManager;
   try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION); } catch {}
   try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); } catch {}
-  // 如仍冲突可再禁用指针选择:
-  // try { fm.disableFeature(BABYLON.WebXRFeatureName.POINTER_SELECTION); } catch {}
 
   // ---------- 运行状态 ----------
   const models = [];          // TransformNode 容器列表(每个实例一个容器)
@@ -160,22 +158,20 @@ var createScene = async function () {
     const container = new BABYLON.TransformNode("model_" + models.length, scene);
     container.__spawnContainer = true;
     container.rotationQuaternion = new BABYLON.Quaternion();
-    container.metadata = { velPlanar: new BABYLON.Vector3(0,0,0) };
+    // 运动状态:目标速度、当前速度
+    container.metadata = { velPlanar: new BABYLON.Vector3(0,0,0), velTarget: new BABYLON.Vector3(0,0,0) };
 
-    // 实例化:不加入场景的模板 → 生成可用的节点集合
     const inst = prefabContainer.instantiateModelsToScene(
       name => container.name + "_inst_" + name,
-      false  // cloneMaterials=false(共享材质)
+      false
     );
 
-    // 把所有 rootNodes 收拢到容器下,并显式启用+可见
     inst.rootNodes.forEach(rn => {
       rn.parent = container;
       rn.setEnabled(true);
       rn.getDescendants(false).forEach(n => n.setEnabled?.(true));
       if (!rn.rotationQuaternion) rn.rotationQuaternion = BABYLON.Quaternion.Identity();
     });
-    // mesh 可见/可拾取,并回指容器
     inst.rootNodes.forEach(rn => {
       rn.getChildMeshes().forEach(m => {
         m.isVisible = true;
@@ -185,10 +181,8 @@ var createScene = async function () {
       });
     });
 
-    // 应用姿态
     applyPoseToNode(pose, container);
 
-    // 若模型原始“前向 = +Z”,按你的约定给容器绕Y旋转180度
     if (MODEL_FORWARD_SIGN === +1) {
       const rot180Y = BABYLON.Quaternion.FromEulerAngles(0, Math.PI, 0);
       container.rotationQuaternion = rot180Y.multiply(container.rotationQuaternion);
@@ -246,8 +240,7 @@ var createScene = async function () {
       if (trigger) {
         trigger.onButtonStateChangedObservable.add((state) => {
           if (state.changes.pressed && state.pressed && latestHitPose) {
-            const inst = spawnModelAtPose(latestHitPose);
-            // 不再设置旋转目标;纯平移控制
+            spawnModelAtPose(latestHitPose);
           }
         });
       }
@@ -256,6 +249,11 @@ var createScene = async function () {
       const session = xr.baseExperience.sessionManager.session;
       const refSpace = xr.baseExperience.sessionManager.referenceSpace;
       const hitTestSource = await session.requestHitTestSource({ space: controller.inputSource.targetRaySpace });
+
+      // —— 临时向量,避免每帧分配 —— //
+      const tmpDesired = new BABYLON.Vector3();
+      const tmpRight = new BABYLON.Vector3();
+      const tmpFwd = new BABYLON.Vector3();
 
       xr.baseExperience.sessionManager.onXRFrameObservable.add((xrFrame) => {
         // hit test
@@ -285,29 +283,60 @@ var createScene = async function () {
             : null;
         } else { selectedContainer = null; }
 
-        // ==== 平面“二维移动”控制(无旋转)====
+        // ==== 平面“二维移动”控制(丝滑版)====
         if (selectedContainer) {
-          const dt = scene.getEngine().getDeltaTime() / 1000;
+          // —— 时间步:限制 dt,防止偶发卡顿引起的大跳 —— //
+          let dt = scene.getEngine().getDeltaTime() / 1000;
+          if (dt > 1/15) dt = 1/15;   // 上限 ~66ms
 
-          // 基于相机的水平前向/右向
-          const { fwdPlanar, right } = getPlanarBasis();
+          // 参数(可按手感微调)
+          const DEADZONE = 0.15;      // 摇杆死区
+          const SPEED_MAX = 1.2;      // m/s 最大速度
+          const ACC_MAX = 4.0;        // m/s^2 最大加速度
+          const FRICTION = 6.0;       // 速度阻尼(越大收得越快)
+          const RESP_K = 10.0;        // 目标速度的响应平滑系数(指数平滑)
 
-          // 输入映射:右推右移,上推前进
-          const moveSpeed = 0.6; // m/s,可按需要调
-          const vx = rightAxisX * moveSpeed;  // 侧移
-          const vz = -rightAxisY * moveSpeed; // 前后(上推为负→前进)
+          // 取相机为基的水平基向量
+          const basis = getPlanarBasis();
+          tmpRight.copyFrom(basis.right);
+          tmpFwd.copyFrom(basis.fwdPlanar);
 
-          const desiredVel = right.scale(vx).add(fwdPlanar.scale(vz));
+          // 输入 → 死区 & 曲线(立方曲线增加细节)
+          let ix = Math.abs(rightAxisX) < DEADZONE ? 0 : rightAxisX;
+          let iy = Math.abs(rightAxisY) < DEADZONE ? 0 : rightAxisY;
+          ix = Math.sign(ix) * Math.pow(Math.abs(ix), 3);
+          iy = Math.sign(iy) * Math.pow(Math.abs(iy), 3);
 
-          // 阻尼平滑
+          // 目标速度(相机右向、前向),上推前进
+          tmpDesired.copyFrom(tmpRight).scaleInPlace(ix * SPEED_MAX)
+                   .addInPlace(tmpFwd.scale(-iy * SPEED_MAX)); // 注意 -iy
+
+          // 指数平滑到 velTarget(避免“抖/顿”)
           const md = selectedContainer.metadata;
-          if (!md.velPlanar) md.velPlanar = new BABYLON.Vector3(0,0,0);
-          const transSmooth = 8.0;
-          md.velPlanar.x += (desiredVel.x - md.velPlanar.x) * (1 - Math.exp(-transSmooth * dt));
-          md.velPlanar.y = 0;
-          md.velPlanar.z += (desiredVel.z - md.velPlanar.z) * (1 - Math.exp(-transSmooth * dt));
+          const velTarget = md.velTarget || (md.velTarget = new BABYLON.Vector3());
+          const alpha = 1 - Math.exp(-RESP_K * dt); // 无帧率依赖
+          velTarget.x += (tmpDesired.x - velTarget.x) * alpha;
+          velTarget.y = 0;
+          velTarget.z += (tmpDesired.z - velTarget.z) * alpha;
 
-          selectedContainer.position.addInPlace(md.velPlanar.scale(dt));
+          // 当前速度朝目标速度推进,受加速度上限和阻尼影响
+          const vel = md.velPlanar || (md.velPlanar = new BABYLON.Vector3(0,0,0));
+          // 需要的加速度
+          const ax = (velTarget.x - vel.x) / dt;
+          const az = (velTarget.z - vel.z) / dt;
+          // 限幅
+          const aMag = Math.hypot(ax, az);
+          const aLimit = Math.min(ACC_MAX, aMag);
+          const scale = aMag > 1e-6 ? (aLimit / aMag) : 0;
+          vel.x += ax * scale * dt;
+          vel.z += az * scale * dt;
+
+          // 阻尼(松杆自然减速、更丝滑)
+          const damp = Math.exp(-FRICTION * dt);
+          vel.x *= damp; vel.z *= damp; vel.y = 0;
+
+          // 位移
+          selectedContainer.position.addInPlace(vel.scale(dt));
         }
       });
     });
